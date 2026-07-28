@@ -135,6 +135,18 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only the right arm"):
             launcher.with_active_single_arm_instruction("Use the left arm.", "right")
 
+    def test_both_arm_prompt_is_explicit_and_rejects_single_arm_wording(self):
+        self.assertEqual(
+            launcher.with_active_arm_instruction("pick up the lid", "both"),
+            "pick up the lid using both arms.",
+        )
+        self.assertEqual(
+            launcher.with_active_arm_instruction("Use both arms.", "both"),
+            "Use both arms.",
+        )
+        with self.assertRaisesRegex(ValueError, "only names the left arm"):
+            launcher.with_active_arm_instruction("Use the left arm.", "both")
+
     def test_absolute_action_chunk_is_replanned_from_live_state(self):
         env = _OneDofEnv()
         policy = _Policy()
@@ -214,6 +226,39 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         model_action = np.full(14, 123.0, dtype=np.float32)
         np.testing.assert_array_equal(mask.command_target(model_action, measured), measured)
 
+    def test_bimanual_both_arm_guard_rate_limits_and_rejects_large_jumps(self):
+        reject_limit = np.array(
+            [0.5] * 6 + [1.0] + [0.5] * 6 + [1.0], dtype=np.float32
+        )
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+            both_arm_max_delta=0.03,
+            both_arm_reject_delta=reject_limit,
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.full(14, 0.2, dtype=np.float32)
+        action[6] = 1.0
+        action[13] = 1.0
+        applied = mask.command_target(action, measured)
+        np.testing.assert_allclose(applied, np.full(14, 0.03, dtype=np.float32))
+        self.assertEqual(
+            mask.manifest_metadata()["both_arm_delta_guard"]["reference"],
+            "fresh_encoder_feedback_each_tick",
+        )
+
+        action[0] = 0.51
+        with self.assertRaisesRegex(RuntimeError, "discontinuous absolute target"):
+            mask.command_target(action, measured)
+
+    def test_bimanual_both_arm_shadow_never_needs_delta_guard(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="both", execution_mode="shadow"
+        )
+        measured = np.arange(14, dtype=np.float32)
+        model_action = np.full(14, 123.0, dtype=np.float32)
+        np.testing.assert_array_equal(mask.command_target(model_action, measured), measured)
+
     def test_bimanual_execution_requires_explicit_side_and_order(self):
         with self.assertRaisesRegex(ValueError, "requires --active-arm-side"):
             launcher.resolve_bimanual_execution_mask(
@@ -223,6 +268,28 @@ class ClosedLoopRolloutTests(unittest.TestCase):
             launcher.resolve_bimanual_execution_mask(
                 bimanual=False, active_arm_side=None, execution_mode=None
             )
+        with self.assertRaisesRegex(ValueError, "explicit CLI flags"):
+            launcher.resolve_bimanual_execution_mask(
+                bimanual=True,
+                active_arm_side="both",
+                execution_mode="active_arm_hold",
+            )
+        with self.assertRaisesRegex(ValueError, "both_arm_max_delta"):
+            launcher.resolve_bimanual_execution_mask(
+                bimanual=True,
+                active_arm_side="both",
+                execution_mode="active_arm_hold",
+                both_arm_active_cli_confirmed=True,
+            )
+        dual_mask = launcher.resolve_bimanual_execution_mask(
+            bimanual=True,
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+            both_arm_active_cli_confirmed=True,
+            both_arm_max_delta=0.03,
+            both_arm_reject_delta=[0.5] * 6 + [1.0] + [0.5] * 6 + [1.0],
+        )
+        self.assertEqual(dual_mask.active_arm_side, "both")
         launcher.validate_bimanual_model_arm_order(
             {"model_arm_side": "left"}, {"model_arm_side": "right"}
         )
@@ -603,7 +670,6 @@ robot:
 
         self.assertEqual(primary_robot.closed, 1)
         self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
-
 
 if __name__ == "__main__":
     unittest.main()

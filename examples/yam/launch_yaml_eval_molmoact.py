@@ -234,14 +234,32 @@ class Args:
     right_config_path: Optional[str] = None
     """Path to the right arm configuration YAML file (for bimanual operation)."""
 
-    active_arm_side: Optional[Literal["left", "right"]] = None
-    """Bimanual mode only: execute this model arm half and hold the other arm at feedback."""
+    active_arm_side: Optional[Literal["left", "right", "both"]] = None
+    """Bimanual mode only: execute the selected policy half, or both 7-DoF halves."""
 
     execution_mode: Optional[Literal["active_arm_hold", "shadow"]] = None
-    """Bimanual mode only: ``shadow`` sends only feedback-hold targets to both arms."""
+    """Bimanual mode only: ``shadow`` holds both arms; ``active_arm_hold`` executes active halves."""
+
+    confirm_bimanual_clearance: bool = False
+    """Required for active dual-arm motion after the operator verifies a clear, separated start pose."""
 
     num_rollouts: Annotated[int, tyro.conf.arg(aliases=("-n",))] = 1
     """How many rollouts to run in this session."""
+
+
+def has_explicit_both_arm_cli_opt_in(args: Args) -> bool:
+    """Return whether the user explicitly opted in to active both-arm motion.
+
+    A YAML file may select ``both`` with ``shadow`` for an audit-only run, but
+    it must not be able to turn an ordinary invocation into an active dual-arm
+    run.  Keep this check on the parsed CLI values rather than the resolved
+    config values for that reason.
+    """
+    return (
+        args.active_arm_side == "both"
+        and args.execution_mode == "active_arm_hold"
+        and args.confirm_bimanual_clearance
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,33 +521,69 @@ def _build_env(
 # ---------------------------------------------------------------------------
 
 
+def _coerce_bimanual_delta_limit(
+    value: Any,
+    *,
+    name: str,
+    state_dim: int,
+) -> np.ndarray:
+    """Normalize a scalar or native 14-D dual-arm action safety limit."""
+    if value is None:
+        raise ValueError(
+            f"Active both-arm execution requires eval.bimanual.{name} in the "
+            "primary configuration."
+        )
+    result = np.asarray(value, dtype=np.float32)
+    if result.ndim == 0:
+        result = np.full(state_dim, float(result), dtype=np.float32)
+    else:
+        result = result.reshape(-1)
+        if result.shape != (state_dim,):
+            raise ValueError(
+                f"eval.bimanual.{name} must be a positive scalar or {state_dim}-D "
+                f"[left(7), right(7)] vector, got {result.shape}"
+            )
+    if not np.isfinite(result).all() or np.any(result <= 0.0):
+        raise ValueError(
+            f"eval.bimanual.{name} must contain only finite positive values"
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class BimanualActiveArmHoldMask:
-    """Safely execute one half of a 14-DoF BimanualYAM action plan.
+    """Safely select which halves of a 14-DoF BimanualYAM plan may execute.
 
     The released MolmoAct checkpoint was trained with state/action order
     ``[left arm (7), right arm (7)]``.  It must therefore receive feedback
     from *both* physical arms.  The model is still free to predict both
-    halves, but this adapter replaces the inactive half with the latest
-    encoder feedback just before each command is sent.  Holding from fresh
-    feedback (rather than an old start pose) avoids fighting a small passive
-    displacement of the inactive arm.
+    halves.  In single-arm mode this adapter replaces the inactive half with
+    the latest encoder feedback just before each command is sent. Holding from
+    fresh feedback (rather than an old start pose) avoids fighting a small
+    passive displacement of the inactive arm. In explicit ``both`` mode, a
+    native 14-D target is rejected on a large discontinuity and otherwise
+    rate-bounded around fresh feedback before it is sent.
 
     ``shadow`` is deliberately stronger: it replaces both halves with live
     feedback so that a policy rollout can be inspected without intentionally
     changing either arm's pose.
     """
 
-    active_arm_side: Literal["left", "right"]
+    active_arm_side: Literal["left", "right", "both"]
     execution_mode: Literal["active_arm_hold", "shadow"] = "active_arm_hold"
 
     state_dim: int = 14
     arm_dim: int = 7
+    # Required only for active both-arm execution.  A scalar expands to all
+    # fields; a 14-D vector lets gripper aperture use a different bound from
+    # arm-joint radians.
+    both_arm_max_delta: Optional[Any] = None
+    both_arm_reject_delta: Optional[Any] = None
 
     def __post_init__(self) -> None:
-        if self.active_arm_side not in {"left", "right"}:
+        if self.active_arm_side not in {"left", "right", "both"}:
             raise ValueError(
-                "active_arm_side must be 'left' or 'right', got "
+                "active_arm_side must be 'left', 'right', or 'both', got "
                 f"{self.active_arm_side!r}"
             )
         if self.execution_mode not in {"active_arm_hold", "shadow"}:
@@ -537,18 +591,90 @@ class BimanualActiveArmHoldMask:
                 "execution_mode must be 'active_arm_hold' or 'shadow', got "
                 f"{self.execution_mode!r}"
             )
+        if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
+            max_delta = _coerce_bimanual_delta_limit(
+                self.both_arm_max_delta,
+                name="both_arm_max_delta",
+                state_dim=self.state_dim,
+            )
+            reject_delta = _coerce_bimanual_delta_limit(
+                self.both_arm_reject_delta,
+                name="both_arm_reject_delta",
+                state_dim=self.state_dim,
+            )
+            if np.any(reject_delta < max_delta):
+                raise ValueError(
+                    "eval.bimanual.both_arm_reject_delta must be at least "
+                    "both_arm_max_delta for every field"
+                )
+            object.__setattr__(self, "both_arm_max_delta", max_delta)
+            object.__setattr__(self, "both_arm_reject_delta", reject_delta)
 
     @property
     def active_slice(self) -> slice:
-        return slice(0, self.arm_dim) if self.active_arm_side == "left" else slice(self.arm_dim, self.state_dim)
+        if self.active_arm_side == "both":
+            return slice(0, self.state_dim)
+        return (
+            slice(0, self.arm_dim)
+            if self.active_arm_side == "left"
+            else slice(self.arm_dim, self.state_dim)
+        )
 
     @property
     def inactive_slice(self) -> slice:
-        return slice(self.arm_dim, self.state_dim) if self.active_arm_side == "left" else slice(0, self.arm_dim)
+        if self.active_arm_side == "both":
+            # An empty slice is convenient for callers that need to apply an
+            # inactive-arm operation without special casing the both-arm mode.
+            return slice(0, 0)
+        return (
+            slice(self.arm_dim, self.state_dim)
+            if self.active_arm_side == "left"
+            else slice(0, self.arm_dim)
+        )
 
     @property
     def active_gripper_index(self) -> int:
+        if self.active_arm_side == "both":
+            raise ValueError(
+                "both-arm execution has two active grippers; use active_grippers"
+            )
         return self.active_slice.stop - 1
+
+    @property
+    def active_grippers(self) -> Tuple[Tuple[str, int], ...]:
+        """Named active gripper action fields for logging and audit output."""
+        if self.active_arm_side == "both":
+            return (("left", self.arm_dim - 1), ("right", self.state_dim - 1))
+        return ((self.active_arm_side, self.active_gripper_index),)
+
+    @property
+    def execution_summary(self) -> str:
+        if self.execution_mode == "shadow":
+            return "both arms held from live encoder feedback (shadow)"
+        if self.active_arm_side == "both":
+            return "both native policy halves enabled with delta guard"
+        return f"{self.active_arm_side} policy half enabled; opposite arm held from live feedback"
+
+    def manifest_metadata(self) -> Dict[str, Any]:
+        """Return the execution contract recorded alongside a rollout."""
+        result: Dict[str, Any] = {
+            "model_state_order": "left(0:7), right(7:14)",
+            "active_arm_side": self.active_arm_side,
+            "execution_mode": self.execution_mode,
+            "commanded_policy_halves": (
+                ["left", "right"]
+                if self.execution_mode == "active_arm_hold"
+                and self.active_arm_side == "both"
+                else ([self.active_arm_side] if self.execution_mode == "active_arm_hold" else [])
+            ),
+        }
+        if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
+            result["both_arm_delta_guard"] = {
+                "max_delta": np.asarray(self.both_arm_max_delta).tolist(),
+                "reject_delta": np.asarray(self.both_arm_reject_delta).tolist(),
+                "reference": "fresh_encoder_feedback_each_tick",
+            }
+        return result
 
     def validate_state(self, state: Any, *, name: str = "state") -> np.ndarray:
         result = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -571,6 +697,36 @@ class BimanualActiveArmHoldMask:
         action = self.validate_state(policy_action, name="policy_action")
         command = measured.copy()
         if self.execution_mode == "active_arm_hold":
+            if self.active_arm_side == "both":
+                # Grippers are normalized apertures, not motor coordinates.
+                # Validate both raw model values before any half reaches the
+                # serial left-then-right dispatcher.
+                for arm_label, gripper_index in self.active_grippers:
+                    aperture = float(action[gripper_index])
+                    if not -0.05 <= aperture <= 1.05:
+                        raise RuntimeError(
+                            "Bimanual action guard rejected an invalid "
+                            f"{arm_label} gripper aperture {aperture:.4f}; "
+                            "no target was sent."
+                        )
+
+                delta = action - measured
+                reject_delta = np.asarray(self.both_arm_reject_delta, dtype=np.float32)
+                rejected = np.flatnonzero(np.abs(delta) > reject_delta)
+                if rejected.size:
+                    details = ", ".join(
+                        f"{int(index)}: |{float(delta[index]):.3f}|>"
+                        f"{float(reject_delta[index]):.3f}"
+                        for index in rejected[:4]
+                    )
+                    suffix = "" if rejected.size <= 4 else f" (+{rejected.size - 4} more)"
+                    raise RuntimeError(
+                        "Bimanual action guard rejected a discontinuous "
+                        f"absolute target ({details}{suffix}); no target was sent."
+                    )
+                max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
+                command = measured + np.clip(delta, -max_delta, max_delta)
+                return command.astype(np.float32, copy=False)
             command[self.active_slice] = action[self.active_slice]
         return command
 
@@ -580,12 +736,18 @@ def resolve_bimanual_execution_mask(
     bimanual: bool,
     active_arm_side: Optional[str],
     execution_mode: Optional[str],
+    both_arm_active_cli_confirmed: bool = False,
+    both_arm_max_delta: Any = None,
+    both_arm_reject_delta: Any = None,
 ) -> Optional[BimanualActiveArmHoldMask]:
     """Build the explicit safe execution adapter before opening motors.
 
     There is intentionally no implicit "execute both arms" setting for this
-    physical launcher.  A full 14-D policy output without an explicit hold
-    mask is too easy to send to the wrong physical side.
+    physical launcher. A full 14-D policy output without an explicit selector
+    is too easy to send to the wrong physical side. ``both`` additionally
+    requires an explicit execution mode, and active both-arm motion requires
+    a separate CLI-origin confirmation from ``main``. Configuration defaults
+    may therefore select only the safe both-arm ``shadow`` path.
     """
     if not bimanual:
         raise ValueError(
@@ -596,13 +758,29 @@ def resolve_bimanual_execution_mask(
 
     if active_arm_side is None:
         raise ValueError(
-            "Bimanual physical execution requires --active-arm-side {left,right}. "
-            "The other arm is then held at live encoder feedback."
+            "Bimanual physical execution requires --active-arm-side {left,right,both}. "
+            "For left/right the other arm is held at live encoder feedback."
+        )
+    side = str(active_arm_side).lower()
+    if side == "both" and execution_mode is None:
+        raise ValueError(
+            "--active-arm-side both requires an explicit --execution-mode "
+            "{active_arm_hold,shadow}; use active_arm_hold only when both "
+            "physical arms are clear to move."
         )
     mode = "active_arm_hold" if execution_mode is None else str(execution_mode)
+    if side == "both" and mode == "active_arm_hold" and not both_arm_active_cli_confirmed:
+        raise ValueError(
+            "Active both-arm motion requires these explicit CLI flags: "
+            "--active-arm-side both --execution-mode active_arm_hold "
+            "--confirm-bimanual-clearance. "
+            "A config file may select both arms only with execution_mode: shadow."
+        )
     return BimanualActiveArmHoldMask(
-        active_arm_side=str(active_arm_side).lower(),
+        active_arm_side=side,
         execution_mode=mode,
+        both_arm_max_delta=both_arm_max_delta,
+        both_arm_reject_delta=both_arm_reject_delta,
     )
 
 
@@ -754,28 +932,31 @@ def run_one_rollout(
             # The YAM checkpoint emits a normalized aperture: 0=closed,
             # 1=open. The robot-side mapper is solely responsible for mapping
             # this value into its calibrated physical gripper coordinate.
-            gripper_index = (
-                execution_mask.active_gripper_index
+            grippers = (
+                execution_mask.active_grippers
                 if execution_mask is not None
-                else expected_dofs - 1
+                else (("primary", expected_dofs - 1),)
             )
-            current_gripper = float(np.asarray(obs_pre["joint_positions"])[gripper_index])
-            gripper_targets = action_chunk[:, gripper_index]
-            logger.info(
-                "Gripper targets (normalized aperture%s): current=%.4f, first=%.4f, "
-                "last=%.4f, range=[%.4f, %.4f]",
-                (
-                    f", active {execution_mask.active_arm_side} arm; "
-                    f"inactive arm held from live feedback"
-                    if execution_mask is not None
-                    else ""
-                ),
-                current_gripper,
-                float(gripper_targets[0]),
-                float(gripper_targets[-1]),
-                float(np.min(gripper_targets)),
-                float(np.max(gripper_targets)),
-            )
+            for arm_label, gripper_index in grippers:
+                current_gripper = float(
+                    np.asarray(obs_pre["joint_positions"])[gripper_index]
+                )
+                gripper_targets = action_chunk[:, gripper_index]
+                logger.info(
+                    "Gripper targets (normalized aperture, %s arm%s): "
+                    "current=%.4f, first=%.4f, last=%.4f, range=[%.4f, %.4f]",
+                    arm_label,
+                    (
+                        f", {execution_mask.execution_summary}"
+                        if execution_mask is not None
+                        else ""
+                    ),
+                    current_gripper,
+                    float(gripper_targets[0]),
+                    float(gripper_targets[-1]),
+                    float(np.min(gripper_targets)),
+                    float(np.max(gripper_targets)),
+                )
             chunk_started_at = time.monotonic()
 
         action_index_in_chunk = chunk_index
@@ -822,17 +1003,32 @@ def run_one_rollout(
 # ---------------------------------------------------------------------------
 
 
-def with_active_single_arm_instruction(
+def with_active_arm_instruction(
     instruction: str,
-    single_arm_side: Optional[str],
+    active_arm_side: Optional[str],
 ) -> str:
-    """Make the intentionally executed side unambiguous in the language."""
-    if single_arm_side is None:
+    """Make the physically enabled arm set unambiguous in the language."""
+    if active_arm_side is None:
         return instruction
-    side = str(single_arm_side).lower()
-    if side not in {"left", "right"}:
-        raise ValueError(f"single_arm_side must be 'left' or 'right', got {side!r}")
+    side = str(active_arm_side).lower()
+    if side not in {"left", "right", "both"}:
+        raise ValueError(
+            "active_arm_side must be 'left', 'right', or 'both', got "
+            f"{side!r}"
+        )
     lower = instruction.lower()
+    if side == "both":
+        has_left = "left arm" in lower
+        has_right = "right arm" in lower
+        if has_left != has_right:
+            named_side = "left" if has_left else "right"
+            raise ValueError(
+                "Both-arm execution enables both physical arms, but the instruction "
+                f"only names the {named_side} arm. Rewrite it to describe both arms."
+            )
+        if "both arms" in lower or (has_left and has_right):
+            return instruction
+        return f"{instruction.rstrip('.')} using both arms."
     other_side = "right" if side == "left" else "left"
     if f"{other_side} arm" in lower:
         raise ValueError(
@@ -842,6 +1038,14 @@ def with_active_single_arm_instruction(
     if f"{side} arm" in lower:
         return instruction
     return f"{instruction.rstrip('.')} using the {side} arm."
+
+
+def with_active_single_arm_instruction(
+    instruction: str,
+    single_arm_side: Optional[str],
+) -> str:
+    """Backward-compatible alias for the single-arm instruction helper."""
+    return with_active_arm_instruction(instruction, single_arm_side)
 
 
 def run_session(
@@ -905,7 +1109,7 @@ def run_session(
                 right_cfg=right_cfg,
                 execution_mask=execution_mask,
             )
-            instruction = with_active_single_arm_instruction(
+            instruction = with_active_arm_instruction(
                 prompt_instruction(rollout_idx, num_rollouts, last_prompt),
                 instruction_side,
             )
@@ -934,6 +1138,8 @@ def run_session(
                 process_seed_metadata=process_seed_metadata,
                 project_root=Path(__file__).resolve().parents[2],
             )
+            if execution_mask is not None:
+                rollout_manifest["execution"] = execution_mask.manifest_metadata()
             if policy_rollout_metadata:
                 rollout_manifest["policy"]["rollout"] = policy_rollout_metadata
 
@@ -1092,13 +1298,17 @@ def main() -> None:
         bimanual=bimanual_requested,
         active_arm_side=active_arm_side,
         execution_mode=execution_mode,
+        both_arm_active_cli_confirmed=has_explicit_both_arm_cli_opt_in(args),
+        both_arm_max_delta=bimanual_cfg.get("both_arm_max_delta"),
+        both_arm_reject_delta=bimanual_cfg.get("both_arm_reject_delta"),
     )
     assert raw_right_cfg is not None  # established by the resolver above
     validate_bimanual_model_arm_order(raw_left_cfg, raw_right_cfg)
     print(
         "[bimanual] model state order: left(0:7), right(7:14); "
         f"execution={execution_mask.execution_mode}, "
-        f"active={execution_mask.active_arm_side}, inactive=live-feedback hold"
+        f"active={execution_mask.active_arm_side}; "
+        f"{execution_mask.execution_summary}"
     )
 
     storage_cfg = raw_left_cfg.get("storage") or {}

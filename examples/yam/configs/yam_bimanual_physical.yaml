@@ -1,0 +1,89 @@
+# Primary configuration for a native MolmoAct2-BimanualYAM rollout.
+#
+# State/action field order is fixed by the checkpoint:
+#   0:7   physical left arm / can_left
+#   7:14  physical right arm / can_right
+#
+# This config intentionally starts in ``shadow`` mode. It runs the full model
+# and records both action halves, but commands each arm back to its live
+# encoder feedback. Actual dual-arm motion requires explicit CLI opt-in:
+#   --active-arm-side both --execution-mode active_arm_hold
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (model ``left_cam``)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071792-video-index4"
+    front_camera:
+      # D435 serial 250423122040 (model ``top_cam``)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_435_Intel_R__RealSense_TM__Depth_Camera_435_250423122040-video-index0"
+    right_camera:
+      # D405 serial 402323071794 (model ``right_cam``)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071794-video-index4"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 1000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "red_lid_bimanual"
+  language_instruction: "Using both arms, coordinate to pick up the red lid, place it fully on top of the black box, release it, then move both arms away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "molmoact_bimanual_yam"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  bimanual:
+    # Config may select both arms only for safe shadow execution. Active dual
+    # execution must be chosen explicitly on the command line.
+    active_arm_side: both
+    execution_mode: shadow
+    # At 30 Hz: clamp a nominal target advance to 0.03 rad / aperture per
+    # tick. Arm-joint discontinuities >0.5 rad fail closed; a gripper may
+    # legitimately change its full normalized aperture and is rate-limited.
+    both_arm_max_delta: 0.03
+    both_arm_reject_delta: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0]
+  live_view_enabled: false
+  reproducibility:
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: false
+    warmup: true
+  camera_server:
+    enabled: false
