@@ -378,6 +378,19 @@ def _start_rerun_export_watchdog(
     # from contending with policy inference if a dependency probes hardware.
     child_env["CUDA_VISIBLE_DEVICES"] = ""
     child_env["PYTHONUNBUFFERED"] = "1"
+    # Rerun/Pillow/NumPy dependencies can otherwise inherit very large native
+    # worker pools on Jetson and exhaust the process/thread table after a few
+    # detached exporters. Keep the offline replay handoff lightweight.
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "POLARS_MAX_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        child_env[key] = str(int(rerun_cfg.get("max_export_threads", 2)))
     with open(log_path, "a", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
