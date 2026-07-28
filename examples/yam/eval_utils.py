@@ -7,7 +7,9 @@ Each class/function is independent; the launch script wires them together.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -15,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence
 
 import cv2
 import h5py
@@ -23,6 +25,7 @@ import numpy as np
 from PIL import Image
 
 from camera_client import CameraSubscriber
+from rollout_manifest import write_json_atomic
 
 # ``lerobot_convert`` (and its ``lerobot`` dependency) is imported lazily inside
 # ``convert_session_to_lerobot`` so that running rollouts does not require
@@ -42,6 +45,25 @@ def _save_png(image: np.ndarray, path: Path, compress_level: int) -> None:
     Image.fromarray(image).save(path, compress_level=compress_level)
 
 
+def _atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
+    """Durably publish a small rollout lifecycle marker.
+
+    A separate offline exporter uses these markers, so it must never observe a
+    truncated JSON document while the control process is still alive.
+    """
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 class EvalRolloutSaver:
     """Buffer one rollout's frames in RAM, then flush to PNG + HDF5 on disk.
 
@@ -52,11 +74,16 @@ class EvalRolloutSaver:
         ├── right_rgb/{frame:06d}.png
         ├── front_rgb/{frame:06d}.png
         ├── episode.h5
+        ├── rollout.manifest.json # immutable launch/model/camera/CAN provenance
+        ├── rollout.rrd       # optional post-rollout Rerun export
         └── err.md          # only if write_err() is called
 
-    The HDF5 file holds the joint trajectory (state, next_state) and the
-    language instruction; the PNGs hold the per-frame RGB images. The DROID
-    layout converter (``load_droid_layout_data``) walks this structure.
+    The HDF5 file holds measured joint trajectories, the exact applied policy
+    targets, and policy-plan metadata; the PNGs hold the per-frame RGB images.
+    The extra action fields make it possible to diagnose a rollout after the
+    robot has stopped (including via the optional Rerun export) without adding
+    any visualization work to the control loop. The DROID layout converter
+    ignores the additional datasets.
     """
 
     CAMERA_OBS_TO_KEY = {
@@ -71,11 +98,13 @@ class EvalRolloutSaver:
         instruction: str,
         max_workers: int = 2,
         png_compress_level: int = 1,
+        rollout_manifest: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.rollout_dir = Path(rollout_dir)
         self.instruction = instruction
         self.max_workers = max(1, int(max_workers))
         self.png_compress_level = max(0, min(9, int(png_compress_level)))
+        self.rollout_manifest = dict(rollout_manifest) if rollout_manifest is not None else None
 
         if self.rollout_dir.exists():
             raise FileExistsError(
@@ -84,7 +113,33 @@ class EvalRolloutSaver:
             )
         self.rollout_dir.mkdir(parents=True)
 
+        # Persist static provenance before the first motor command.  A later
+        # abnormal process exit can leave only a partial frame buffer, but it
+        # must never erase which model/config/camera/CAN setup produced it.
+        if self.rollout_manifest is not None:
+            write_json_atomic(self.rollout_dir / "rollout.manifest.json", self.rollout_manifest)
+
+        # This marker is deliberately written before any control steps.  If a
+        # process dies during final flush, the detached Rerun exporter can
+        # still create a camera-only, explicitly incomplete replay rather than
+        # silently leaving no .rrd at all.
+        started_marker: Dict[str, Any] = {
+            "schema_version": 1,
+            "instruction": self.instruction,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if self.rollout_manifest is not None:
+            started_marker["manifest_file"] = "rollout.manifest.json"
+            reproducibility = self.rollout_manifest.get("reproducibility")
+            if isinstance(reproducibility, Mapping):
+                started_marker["rollout_seed"] = reproducibility.get("rollout_seed")
+        _atomic_write_json(
+            self.rollout_dir / "rollout.started.json",
+            started_marker,
+        )
+
         self._buffer: List[Dict[str, Any]] = []
+        self._policy_action_chunks: List[Dict[str, Any]] = []
 
     @property
     def num_steps(self) -> int:
@@ -94,6 +149,10 @@ class EvalRolloutSaver:
         self,
         obs_pre: Dict[str, Any],
         obs_post: Dict[str, Any],
+        action: Optional[np.ndarray] = None,
+        policy_chunk_index: Optional[int] = None,
+        policy_action_index: Optional[int] = None,
+        policy_inference_sec: Optional[float] = None,
     ) -> None:
         """Buffer one control-step record.
 
@@ -107,21 +166,135 @@ class EvalRolloutSaver:
             "state": np.asarray(obs_pre["joint_positions"], dtype=np.float32).copy(),
             "next_state": np.asarray(obs_post["joint_positions"], dtype=np.float32).copy(),
         }
+        if action is not None:
+            record["action"] = np.asarray(action, dtype=np.float32).copy()
+        if policy_chunk_index is not None:
+            record["policy_chunk_index"] = int(policy_chunk_index)
+        if policy_action_index is not None:
+            record["policy_action_index"] = int(policy_action_index)
+        if policy_inference_sec is not None:
+            record["policy_inference_sec"] = float(policy_inference_sec)
         for obs_key, cam_key in self.CAMERA_OBS_TO_KEY.items():
             img = obs_pre.get(obs_key)
             if img is not None:
                 record[cam_key] = np.ascontiguousarray(img).copy()
         self._buffer.append(record)
 
+    def add_policy_action_chunk(
+        self,
+        start_step: int,
+        actions: np.ndarray,
+        inference_sec: float,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Persist a complete policy plan for post-rollout inspection.
+
+        ``actions`` is deliberately copied here: it is tiny compared with the
+        images and records the model's original plan before the rollout loop
+        starts consuming it. This method does no disk I/O or visualization and
+        therefore cannot affect control-loop timing.
+        """
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim != 2 or len(actions) == 0:
+            raise ValueError(f"policy action chunk must be a nonempty 2D array, got {actions.shape}")
+        self._policy_action_chunks.append(
+            {
+                "start_step": int(start_step),
+                "actions": actions.copy(),
+                "inference_sec": float(inference_sec),
+                "metadata_json": (
+                    json.dumps(dict(metadata), sort_keys=True, default=str)
+                    if metadata is not None
+                    else None
+                ),
+            }
+        )
+
     def flush(self) -> None:
-        """Write buffered PNGs and ``episode.h5`` to ``rollout_dir``."""
+        """Persist telemetry first, then camera PNGs, and mark a complete raw run.
+
+        ``episode.h5`` is the compact source of truth for a replay's state,
+        applied actions, and policy plans.  It is deliberately atomically
+        published *before* the comparatively slow PNG compression phase.  If
+        a user interrupts that phase, the detached Rerun exporter can still
+        create a telemetry-bearing replay from the HDF5 file rather than
+        falling back to a camera-only trace.
+        """
         if not self._buffer:
             logger.warning("Empty buffer at %s; nothing to flush.", self.rollout_dir)
             return
 
+        # A camera can fail to deliver one frame at the end of a rollout.  Do
+        # not let that one sparse record prevent us from writing all telemetry
+        # and the other cameras (the historical 20260727_163712 failure).
         cam_keys_present = sorted(
-            k for k in self.CAMERA_OBS_TO_KEY.values() if k in self._buffer[0]
+            {
+                cam_key
+                for record in self._buffer
+                for cam_key in self.CAMERA_OBS_TO_KEY.values()
+                if record.get(cam_key) is not None
+            }
         )
+        states = np.stack([rec["state"] for rec in self._buffer]).astype(np.float32)
+        next_states = np.stack([rec["next_state"] for rec in self._buffer]).astype(np.float32)
+        cam_names_stripped = [k.replace("_rgb", "") for k in cam_keys_present]
+
+        h5_path = self.rollout_dir / "episode.h5"
+        temporary_h5_path = self.rollout_dir / ".episode.h5.partial"
+        camera_frame_counts = {
+            cam_key: sum(record.get(cam_key) is not None for record in self._buffer)
+            for cam_key in cam_keys_present
+        }
+        try:
+            with h5py.File(temporary_h5_path, "w") as f:
+                f.attrs["language_instruction"] = self.instruction
+                f.attrs["num_steps"] = len(self._buffer)
+                if self.rollout_manifest is not None:
+                    f.attrs["rollout_manifest_file"] = "rollout.manifest.json"
+                f.attrs["camera_names"] = np.array(
+                    cam_names_stripped, dtype=h5py.string_dtype()
+                )
+                f.attrs["camera_frame_counts"] = json.dumps(camera_frame_counts, sort_keys=True)
+                f.create_dataset("state", data=states, compression="gzip", compression_opts=4)
+                f.create_dataset(
+                    "next_state", data=next_states, compression="gzip", compression_opts=4
+                )
+                for key, dtype in (
+                    ("action", np.float32),
+                    ("policy_chunk_index", np.int32),
+                    ("policy_action_index", np.int32),
+                    ("policy_inference_sec", np.float32),
+                ):
+                    if key in self._buffer[0]:
+                        f.create_dataset(
+                            key,
+                            data=np.asarray([rec[key] for rec in self._buffer], dtype=dtype),
+                            compression="gzip",
+                            compression_opts=4,
+                        )
+
+                if self._policy_action_chunks:
+                    chunks_group = f.create_group("policy_action_chunks")
+                    for chunk_idx, chunk in enumerate(self._policy_action_chunks):
+                        dataset = chunks_group.create_dataset(
+                            f"{chunk_idx:06d}",
+                            data=chunk["actions"],
+                            compression="gzip",
+                            compression_opts=4,
+                        )
+                        dataset.attrs["start_step"] = chunk["start_step"]
+                        dataset.attrs["inference_sec"] = chunk["inference_sec"]
+                        if chunk["metadata_json"] is not None:
+                            dataset.attrs["metadata_json"] = chunk["metadata_json"]
+            os.replace(temporary_h5_path, h5_path)
+        except Exception:
+            temporary_h5_path.unlink(missing_ok=True)
+            raise
+
+        # PNG compression can take substantially longer than writing the HDF5
+        # telemetry on a long rollout.  Do it only after ``episode.h5`` has
+        # been atomically published, so an interruption here remains
+        # recoverable by ``rerun_export_watchdog.py``.
         for cam_key in cam_keys_present:
             (self.rollout_dir / cam_key).mkdir(exist_ok=True)
 
@@ -129,28 +302,26 @@ class EvalRolloutSaver:
             futures = []
             for i, rec in enumerate(self._buffer):
                 for cam_key in cam_keys_present:
+                    image = rec.get(cam_key)
+                    if image is None:
+                        continue
                     img_path = self.rollout_dir / cam_key / f"{i:06d}.png"
                     futures.append(
-                        exe.submit(_save_png, rec[cam_key], img_path, self.png_compress_level)
+                        exe.submit(_save_png, image, img_path, self.png_compress_level)
                     )
             for fut in futures:
                 fut.result()
 
-        states = np.stack([rec["state"] for rec in self._buffer]).astype(np.float32)
-        next_states = np.stack([rec["next_state"] for rec in self._buffer]).astype(np.float32)
-        cam_names_stripped = [k.replace("_rgb", "") for k in cam_keys_present]
-
-        h5_path = self.rollout_dir / "episode.h5"
-        with h5py.File(h5_path, "w") as f:
-            f.attrs["language_instruction"] = self.instruction
-            f.attrs["num_steps"] = len(self._buffer)
-            f.attrs["camera_names"] = np.array(
-                cam_names_stripped, dtype=h5py.string_dtype()
-            )
-            f.create_dataset("state", data=states, compression="gzip", compression_opts=4)
-            f.create_dataset(
-                "next_state", data=next_states, compression="gzip", compression_opts=4
-            )
+        _atomic_write_json(
+            self.rollout_dir / "rollout.raw_complete.json",
+            {
+                "schema_version": 1,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "num_steps": len(self._buffer),
+                "camera_frame_counts": camera_frame_counts,
+                "episode_file": h5_path.name,
+            },
+        )
 
         logger.info(
             "Saved rollout: %s (%d steps, cameras=%s)",

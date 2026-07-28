@@ -1,0 +1,82 @@
+# This config must be the primary --config_path for the BimanualYAM model:
+# state/action fields 0:7 are the physical left arm.
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (left wrist view / model ``left_cam``)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071792-video-index4"
+    front_camera:
+      # D435 serial 250423122040 (static overhead view / model ``top_cam``)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_435_Intel_R__RealSense_TM__Depth_Camera_435_250423122040-video-index0"
+    right_camera:
+      # D405 serial 402323071794 (right wrist view)
+      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071794-video-index4"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 30
+# Physical-test horizon: 1,000 control steps at 30 Hz (~33.3 s of action
+# execution, plus replan pauses between 30-action chunks).
+max_steps: 1000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "red_lid_left_arm"
+  language_instruction: "Using the left arm, pick up the red lid, place it fully on top of the black box, open the gripper to release it, then move the arm away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "molmoact_left_arm"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  # Every policy query gets a separate, recorded torch.Generator seed derived
+  # from this base seed. Change it intentionally to sample a different plan.
+  reproducibility:
+    seed: 20260727
+    # Leave CUDA-kernel determinism opt-in; the explicit policy generator is
+    # deterministic either way, while forcing all kernels can reduce support/performance.
+    deterministic_algorithms: false
+  # Gate motor enable on two well-exposed, correctly-sized policy frames.
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  # A detached, camera/CAN-free exporter is armed before robot startup. After
+  # the launcher exits it atomically writes rollout.rrd from raw PNG/HDF5.
+  rerun:
+    enabled: true
+    # Cameras currently capture at 5 Hz; at a 30 Hz control rate, retaining
+    # every sixth saved frame avoids recording duplicate cached frames.
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: false
+    warmup: true
+  camera_server:
+    enabled: false

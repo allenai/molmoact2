@@ -69,7 +69,7 @@ class RobotEnv:
         return self.get_obs()
 
     def step_command_only(
-        self, joints: np.ndarray, reset: Optional[bool] = False
+        self, joints: np.ndarray, reset: Optional[bool] = False, wait: bool = True
     ) -> None:
         """Command the robot + sleep on the control rate. Does NOT read cameras.
 
@@ -86,6 +86,11 @@ class RobotEnv:
             self._robot.command_joint_state(joints)
         else:
             self._robot.command_joint_state(joints - self._dynamic_offset)
+        if wait:
+            self._rate.sleep()
+
+    def wait_for_control_tick(self) -> None:
+        """Wait for the next outer control tick."""
         self._rate.sleep()
 
     def get_robot_state(self) -> Dict[str, Any]:
@@ -123,6 +128,44 @@ class RobotEnv:
 
         observations.update(self.get_robot_state())
         return observations
+
+    def close(self) -> None:
+        """Release physical robot control and camera handles deterministically.
+
+        The robot is closed first so its non-daemon control thread stops and
+        motors are disabled through the driver's regular shutdown path. Camera
+        capture threads are then stopped, which releases V4L2 devices for a
+        camera-only viewer or the next session.
+        """
+        first_error = None
+        close_robot = getattr(self._robot, "close", None)
+        if callable(close_robot):
+            try:
+                close_robot()
+            except Exception as exc:  # noqa: BLE001 -- still release cameras
+                first_error = exc
+
+        if self._camera_client is not None:
+            try:
+                self._camera_client.close()
+            except Exception as exc:  # noqa: BLE001 -- best-effort teardown
+                if first_error is None:
+                    first_error = exc
+            self._camera_client = None
+
+        for camera in self._camera_dict.values():
+            close_camera = getattr(camera, "close", None)
+            if not callable(close_camera):
+                continue
+            try:
+                close_camera()
+            except Exception as exc:  # noqa: BLE001 -- close remaining cameras
+                if first_error is None:
+                    first_error = exc
+        self._camera_dict = {}
+
+        if first_error is not None:
+            raise first_error
 
 
 def main() -> None:

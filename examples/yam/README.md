@@ -26,6 +26,8 @@ examples/yam/
 ├── camera_server.py              # long-lived ZMQ server owning the 3 RealSense cams
 ├── camera_client.py              # ZMQ client + standalone live viewer
 ├── eval_utils.py                 # per-rollout saver, cv2 viewer, labeling, conversion
+├── rerun_rollout.py               # saved rollout -> offline Rerun .rrd playback
+├── rerun_export_watchdog.py       # detached crash-resilient .rrd exporter
 ├── lerobot_convert.py            # raw rollouts -> LeRobot v3.0 dataset
 ├── start_camera_server.sh        # convenience launcher for camera_server.py
 ├── requirements.txt
@@ -92,8 +94,8 @@ stream so the cv2 window keeps repainting during inference.
 
 ```bash
 python examples/yam/launch_yaml_eval_molmoact.py \
-    --left_config_path  examples/yam/configs/yam_left.yaml \
-    --right_config_path examples/yam/configs/yam_right.yaml \
+    --config_path       examples/yam/configs/yam_left.yaml \
+    --right-config-path examples/yam/configs/yam_right.yaml \
     -n 10
 ```
 
@@ -127,6 +129,54 @@ eval_lerobot_v30/<session_ts>/   # LeRobot v3.0 dataset (labeled rollouts, end o
 Each rollout has `episode.h5` (joint trajectory + instruction) and one PNG per
 camera per frame under `left_rgb/`, `front_rgb/`, `right_rgb/`.
 
+## Post-rollout playback in Rerun
+
+Rerun is an **offline** diagnostic artifact, not a live control dependency.
+With `eval.rerun.enabled: true` (enabled in both physical-arm configs), the
+launcher starts and verifies a detached exporter *before* it creates any robot
+or camera resources. After the launcher exits—normally or due to an
+exception—the exporter scans raw rollout directories and atomically publishes
+`rollout.rrd` alongside each one. It never opens a camera, CAN interface, or
+robot, so export cannot affect motion timing.
+
+Normally a replay includes camera frames, encoder feedback, policy targets,
+and action chunks from `episode.h5`. If the launcher dies before HDF5 was
+durably written, the exporter still creates an explicitly marked camera-only
+recovery RRD from synchronized PNGs; it does not invent lost telemetry. Its
+per-rollout state is recorded in `rerun_export.status.json`.
+
+Open the recording after the rollout finishes:
+
+```bash
+/home/npow/molmoact2-venv/bin/rerun \
+  yam_eval_runs/data/red_lid_left_arm/eval/<timestamp>/rollout.rrd
+```
+
+Or use Rerun's browser viewer and open the URL it prints (normally
+`http://127.0.0.1:9090`):
+
+```bash
+/home/npow/molmoact2-venv/bin/rerun --web-viewer --web-viewer-port 9090 \
+  yam_eval_runs/data/red_lid_left_arm/eval/<timestamp>/rollout.rrd
+```
+
+The recording starts with a three-camera timeline and includes:
+
+- the instruction;
+- encoder feedback before and after every command;
+- the exact absolute-joint target sent to the arm and target-minus-feedback;
+- the full 30-action plan at each policy replan, plus inference timing.
+
+For a historical rollout made before Rerun was enabled, convert it after the
+fact (it will show camera and encoder feedback; policy targets are shown only
+when that older `episode.h5` recorded them):
+
+```bash
+PYTHONPATH=examples/yam /home/npow/molmoact2-venv/bin/python \
+  examples/yam/rerun_rollout.py \
+  yam_eval_runs/data/red_lid_left_arm/eval/<timestamp>
+```
+
 ## Key config knobs (`configs/yam_left.yaml`)
 
 | Key | Meaning |
@@ -136,6 +186,7 @@ camera per frame under `left_rgb/`, `front_rgb/`, `right_rgb/`.
 | `eval.local.*` | Checkpoint / device / dtype for `mode: local`. |
 | `eval.camera_server.enabled` | `true` uses the ZMQ camera server; `false` opens cameras in-process. |
 | `eval.live_view_enabled` | `false` disables the cv2 window (headless runs). |
+| `eval.rerun.*` | Post-rollout Rerun export (`image_stride`, JPEG quality, policy chunk size). |
 | `max_steps` | Per-rollout timeout in control steps. |
 | `storage.*` | Output location, instruction, PNG save settings. |
 | `lerobot.*` | End-of-session dataset conversion knobs. |

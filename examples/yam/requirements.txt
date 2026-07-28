@@ -22,6 +22,9 @@ omegaconf
 tyro
 pyzmq
 tqdm
+# Post-rollout playback writer. This is deliberately not imported by the arm
+# control loop; it is used only after a rollout's raw data has been saved.
+rerun-sdk==0.35.0
 
 # RealSense camera SDK (needed unless you only run against pre-recorded obs).
 pyrealsense2

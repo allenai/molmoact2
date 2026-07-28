@@ -81,7 +81,7 @@ class PrintRobot(Robot):
             "joint_positions": joint_state,
             "joint_velocities": joint_state,
             "ee_pos_quat": pos_quat,
-            "gripper_position": np.array(0),
+            "gripper_position": np.array([0.0]),
         }
 
 
@@ -118,6 +118,21 @@ class BimanualRobot(Robot):
                 raise RuntimeError()
 
         return return_obs
+
+    def close(self) -> None:
+        """Close both physical robot wrappers, even if one reports an error."""
+        first_error = None
+        for robot in (self._robot_l, self._robot_r):
+            close = getattr(robot, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 -- attempt both safe shutdowns
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def main():

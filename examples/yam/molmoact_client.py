@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from abc import ABC
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import hf_transfer  # noqa: F401
@@ -31,6 +32,7 @@ from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from gello_min.logging_utils import get_molmoact_logger
+from rollout_manifest import RolloutSeedPlan, SEED_STRATEGY
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
@@ -47,6 +49,13 @@ class PolicyBase(ABC):
     def inference(self, input_dict: Dict[str, Any]) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
+        """Reset per-rollout policy state; remote policies have no RNG contract."""
+        return {"rollout_seed": rollout_seed, "deterministic_generator": False}
+
+    def reproducibility_metadata(self) -> Dict[str, Any]:
+        return {"deterministic_generator": False}
+
 
 # Default to a server running on this host (host_server_yam.py default port).
 DEFAULT_SERVER = "http://127.0.0.1:8202"
@@ -54,7 +63,32 @@ DEFAULT_SERVER = "http://127.0.0.1:8202"
 REPO_ID = "allenai/MolmoAct2-BimanualYAM"
 NORM_TAG = "yam_dual_molmoact2"
 STATE_DIM = 14
+# ``yam_dual_molmoact2`` emits 30 absolute-pose targets per query.  This is
+# kept primarily for status reporting; the rollout executor validates and uses
+# the actual returned chunk length.
+ACTION_HORIZON = 30
 DEFAULT_NUM_STEPS = 10
+
+
+def require_bimanual_state(state: Any, *, source: str) -> np.ndarray:
+    """Validate native checkpoint state order without inventing an arm state.
+
+    ``MolmoAct2-BimanualYAM`` was trained on live 14-D state vectors ordered
+    ``[left(7), right(7)]``.  Padding a one-arm observation with zeroes makes
+    the model reason about a fictional second arm, and cropping its output
+    discards the half it may actually use.  Physical callers must open both
+    arms and use the launcher's active-arm hold mask instead.
+    """
+    result = np.asarray(state, dtype=np.float32).reshape(-1)
+    if result.shape != (STATE_DIM,):
+        raise ValueError(
+            f"{source} requires a live bimanual state shape ({STATE_DIM},) "
+            f"[left(7), right(7)], got {result.shape}. Start both arms with "
+            "--right-config-path; the unsupported 7-D pad/crop adapter is disabled."
+        )
+    if not np.isfinite(result).all():
+        raise ValueError(f"{source} state contains non-finite values")
+    return result
 
 
 def _normalize_server_url(server: Optional[str]) -> str:
@@ -78,7 +112,7 @@ class MolmoAct(PolicyBase):
         self.logger = get_molmoact_logger()
         self.url = _normalize_server_url(server)
         self.multi_views = True
-        self.action_horizon = 25
+        self.action_horizon = ACTION_HORIZON
 
         # Log configuration
         self.logger.info(f"MolmoAct initialized with URL: {self.url}")
@@ -87,6 +121,14 @@ class MolmoAct(PolicyBase):
 
     def get_action_horizon(self):
         return self.action_horizon
+
+    def reproducibility_metadata(self) -> Dict[str, Any]:
+        return {
+            "backend": "http",
+            "endpoint": self.url,
+            "deterministic_generator": False,
+            "note": "remote server does not expose a per-query generator seed",
+        }
 
     def prepare_input(self, obs, instruction):
         self.logger.info("Preparing input for MolmoAct inference")
@@ -108,7 +150,9 @@ class MolmoAct(PolicyBase):
                 "front_camera_rgb": obs["front_camera_rgb"],
                 "right_camera_rgb": obs["right_camera_rgb"],
                 "instruction": instruction,
-                "state": obs["joint_positions"]
+                "state": require_bimanual_state(
+                    obs["joint_positions"], source="MolmoAct"
+                ),
             }
 
             self.logger.info("Input preparation completed successfully")
@@ -346,8 +390,11 @@ class _LocalPolicy:
         enable_cuda_graph: bool = False,
     ) -> None:
         self.default_cuda_graph = enable_cuda_graph
+        self.repo_id = str(repo_id)
 
         local_dir = snapshot_download(repo_id=repo_id)
+        self.snapshot_dir = Path(local_dir).resolve()
+        self.snapshot_revision = self.snapshot_dir.name
         _local_log.info("Resolved snapshot dir: %s", local_dir)
         _patch_modeling_for_bf16(local_dir)
 
@@ -395,6 +442,7 @@ class _LocalPolicy:
         state: Any,
         num_steps: int = DEFAULT_NUM_STEPS,
         enable_cuda_graph: bool = False,
+        generator: Optional[torch.Generator] = None,
     ) -> np.ndarray:
         images = [_to_pil(top_cam), _to_pil(left_cam), _to_pil(right_cam)]
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -413,6 +461,7 @@ class _LocalPolicy:
                 inference_action_mode="continuous",
                 enable_depth_reasoning=False,
                 num_steps=num_steps,
+                generator=generator,
                 normalize_language=True,
                 enable_cuda_graph=enable_cuda_graph,
             )
@@ -436,12 +485,31 @@ class MolmoActLocal(PolicyBase):
         num_steps: int = DEFAULT_NUM_STEPS,
         enable_cuda_graph: bool = False,
         warmup: bool = True,
+        single_arm_side: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> None:
         self.logger = get_molmoact_logger()
         self.multi_views = True
-        self.action_horizon = 25
+        self.action_horizon = ACTION_HORIZON
         self.num_steps = int(num_steps)
         self.enable_cuda_graph = bool(enable_cuda_graph)
+        self.dtype_name = str(dtype)
+        self._configured_seed_plan = RolloutSeedPlan(seed)
+        self._query_seed_plan = RolloutSeedPlan(None)
+        self._rollout_seed = self._configured_seed_plan.rollout_seed(0)
+        self._inference_index = 0
+        # Retain this keyword temporarily so legacy YAML fails at the safer
+        # 14-D state gate rather than at config parsing. It is intentionally
+        # not used to pad/crop a BimanualYAM policy action.
+        if single_arm_side is not None:
+            side = str(single_arm_side).lower()
+            if side not in ("left", "right"):
+                raise ValueError("single_arm_side must be 'left' or 'right'")
+            self.logger.warning(
+                "single_arm_side=%s is ignored: MolmoAct2-BimanualYAM now "
+                "requires native 14-D feedback plus an active-arm hold mask.",
+                side,
+            )
 
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -464,7 +532,8 @@ class MolmoActLocal(PolicyBase):
         )
         self.logger.info(
             f"MolmoActLocal ready. action_horizon={self.action_horizon}, "
-            f"num_steps={self.num_steps}, enable_cuda_graph={self.enable_cuda_graph}"
+            f"num_steps={self.num_steps}, enable_cuda_graph={self.enable_cuda_graph}, "
+            f"generator_seed={'configured' if self._rollout_seed is not None else 'unseeded'}"
         )
 
         if warmup:
@@ -492,17 +561,60 @@ class MolmoActLocal(PolicyBase):
     def get_action_horizon(self) -> int:
         return self.action_horizon
 
+    def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
+        """Start an isolated deterministic random stream for this rollout."""
+        self._rollout_seed = RolloutSeedPlan(rollout_seed).base_seed
+        self._inference_index = 0
+        return {
+            "rollout_seed": self._rollout_seed,
+            "query_seed_strategy": SEED_STRATEGY,
+            "generator_device": self.policy.device,
+            "deterministic_generator": self._rollout_seed is not None,
+        }
+
+    def reproducibility_metadata(self) -> Dict[str, Any]:
+        return {
+            "backend": "local",
+            "repo_id": self.policy.repo_id,
+            "snapshot_dir": str(self.policy.snapshot_dir),
+            "snapshot_revision": self.policy.snapshot_revision,
+            "device": self.policy.device,
+            "dtype": self.dtype_name,
+            "num_steps": self.num_steps,
+            "enable_cuda_graph": self.enable_cuda_graph,
+            "configured_seed": self._configured_seed_plan.base_seed,
+            "query_seed_strategy": SEED_STRATEGY,
+        }
+
+    def _generator_for_next_query(self) -> tuple[Optional[torch.Generator], Dict[str, Any]]:
+        query_index = self._inference_index
+        query_seed = self._query_seed_plan.query_seed(self._rollout_seed, query_index)
+        metadata: Dict[str, Any] = {
+            "rollout_seed": self._rollout_seed,
+            "query_index": query_index,
+            "query_seed": query_seed,
+            "seed_strategy": SEED_STRATEGY,
+        }
+        if query_seed is None:
+            return None, metadata
+        generator = torch.Generator(device=self.policy.device)
+        generator.manual_seed(query_seed)
+        return generator, metadata
+
     def prepare_input(self, obs: dict, instruction: str) -> dict:
         self.logger.info(
             f"Preparing input for MolmoActLocal (instruction: '{instruction}')"
         )
         try:
+            state = require_bimanual_state(
+                obs["joint_positions"], source="MolmoActLocal"
+            )
             return {
                 "left_camera_rgb": obs["left_camera_rgb"],
                 "front_camera_rgb": obs["front_camera_rgb"],
                 "right_camera_rgb": obs["right_camera_rgb"],
                 "instruction": instruction,
-                "state": obs["joint_positions"],
+                "state": state,
             }
         except KeyError as e:
             self.logger.error(f"Missing key in observation: {e}")
@@ -510,6 +622,7 @@ class MolmoActLocal(PolicyBase):
 
     def inference(self, input_dict: dict) -> dict:
         t0 = time.time()
+        generator, reproducibility = self._generator_for_next_query()
         actions = self.policy.predict(
             top_cam=input_dict["front_camera_rgb"],
             left_cam=input_dict["left_camera_rgb"],
@@ -518,9 +631,13 @@ class MolmoActLocal(PolicyBase):
             state=input_dict["state"],
             num_steps=self.num_steps,
             enable_cuda_graph=self.enable_cuda_graph,
+            generator=generator,
         )
+        # Advance only after a successful query so an operator retrying a
+        # transient model failure receives the same sampled action plan.
+        self._inference_index += 1
         self.logger.info(
             f"Local inference completed in {time.time() - t0:.3f}s "
             f"({len(actions)} actions)"
         )
-        return {"actions": actions}
+        return {"actions": actions, "reproducibility": reproducibility}
