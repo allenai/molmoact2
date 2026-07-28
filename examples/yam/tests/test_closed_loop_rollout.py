@@ -500,6 +500,57 @@ class RolloutRecordingTests(unittest.TestCase):
             with h5py.File(rollout_dir / "episode.h5", "r") as h5:
                 np.testing.assert_allclose(h5["action"][:], [[0.25]])
 
+    def test_session_keyboard_interrupt_is_not_clean_exit(self):
+        """Ctrl-C saves partial artifacts but must not enable teardown motion."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            left_cfg = {
+                "storage": {
+                    "base_dir": str(root),
+                    "task_directory": "interrupted_session",
+                    "language_instruction": "test interrupt",
+                },
+                "max_steps": 10,
+                "eval": {"live_view_enabled": False},
+            }
+
+            def interrupt_after_one_saved_step(*, saver, **_kwargs):
+                saver.add_step(
+                    obs_pre={"joint_positions": np.array([0.0], dtype=np.float32)},
+                    obs_post={"joint_positions": np.array([0.1], dtype=np.float32)},
+                    action=np.array([0.25], dtype=np.float32),
+                )
+                raise KeyboardInterrupt
+
+            with (
+                patch.object(launcher, "move_to_rollout_start"),
+                patch.object(launcher, "prompt_instruction", return_value="test interrupt"),
+                patch.object(launcher, "build_rollout_manifest", return_value={"policy": {}}),
+                patch.object(launcher, "run_one_rollout", side_effect=interrupt_after_one_saved_step),
+                patch.object(
+                    launcher,
+                    "LiveCameraView",
+                    return_value=SimpleNamespace(close=lambda: None),
+                ),
+                patch.object(launcher, "_convert_if_any"),
+            ):
+                result = launcher.run_session(
+                    env=object(),
+                    policy=object(),
+                    left_cfg=left_cfg,
+                    right_cfg=None,
+                    bimanual=False,
+                    num_rollouts=1,
+                )
+
+            self.assertFalse(result.clean_exit)
+            self.assertEqual(len(result.saved_rollouts), 1)
+            rollout_dir = result.saved_rollouts[0]
+            self.assertTrue((rollout_dir / "episode.h5").is_file())
+            err_text = (rollout_dir / "err.md").read_text(encoding="utf-8")
+            self.assertIn("KeyboardInterrupt", err_text)
+            self.assertIn("Steps actually saved: 1", err_text)
+
     def test_saved_actions_and_offline_rerun_recording(self):
         """Rerun conversion is post-hoc and has the exact applied commands."""
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -151,6 +151,12 @@ _return_to_rest_max_joint_step: float = 0.01
 _rest_return_eligible: bool = False
 
 
+@dataclass(frozen=True)
+class SessionResult:
+    saved_rollouts: List[Path]
+    clean_exit: bool
+
+
 def capture_rest_pose_at_startup(
     env: RobotEnv,
     *,
@@ -1365,13 +1371,13 @@ def run_session(
     primary_config_path: Optional[str] = None,
     secondary_config_path: Optional[str] = None,
     process_seed_metadata: Optional[Dict[str, Any]] = None,
-) -> List[Path]:
+) -> SessionResult:
     """Drive ``num_rollouts`` rollouts; convert the labeled set to LeRobot at the end.
 
     Catches ``KeyboardInterrupt`` so an in-progress rollout still gets flushed
     (as incomplete, with ``err.md``) and any rollouts already labeled in this
     session are still converted. Returns saved rollout paths for post-shutdown
-    diagnostics such as Rerun export.
+    diagnostics such as Rerun export, plus whether the session ended normally.
     """
     storage = left_cfg["storage"]
     base_save_dir = Path(storage["base_dir"]) / "data" / storage["task_directory"]
@@ -1402,6 +1408,7 @@ def run_session(
     labeled_rollouts: List[Path] = []
     global _rest_return_eligible
     saved_rollouts: List[Path] = []
+    clean_exit = True
     saver: Optional[EvalRolloutSaver] = None
     outcome: Optional[RolloutOutcome] = None
 
@@ -1490,6 +1497,7 @@ def run_session(
             saver = None
             outcome = None
     except KeyboardInterrupt:
+        clean_exit = False
         print("\n[interrupt] Ctrl-C received — saving incomplete rollout, then converting...")
         if saver is not None:
             try:
@@ -1503,6 +1511,7 @@ def run_session(
             except Exception as exc:  # noqa: BLE001 — best-effort cleanup
                 logger.exception("Failed to flush incomplete rollout: %s", exc)
     except Exception as exc:
+        clean_exit = False
         # Preserve the telemetry gathered before a runtime failure (for
         # example, an action-guard rejection).  ``run_one_rollout`` buffers
         # steps in RAM, so without this path an exception loses the evidence
@@ -1528,7 +1537,7 @@ def run_session(
         live_view.close()
         _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
 
-    return saved_rollouts
+    return SessionResult(saved_rollouts=saved_rollouts, clean_exit=clean_exit)
 
 
 def _convert_if_any(
@@ -1668,7 +1677,7 @@ def main() -> None:
     _right_cfg = right_cfg
     _bimanual_execution_mask = execution_mask
 
-    saved_rollouts: List[Path] = []
+    session_result = SessionResult(saved_rollouts=[], clean_exit=False)
     try:
         capture_rest_pose_at_startup(
             env,
@@ -1690,7 +1699,7 @@ def main() -> None:
             f"max_steps: {left_cfg.get('max_steps', 1000)}"
         )
 
-        saved_rollouts = run_session(
+        session_result = run_session(
             env=env,
             policy=policy,
             left_cfg=left_cfg,
@@ -1706,14 +1715,14 @@ def main() -> None:
         # A known-complete session is the only condition under which teardown
         # may move the robot back to its captured pose. Faults and Ctrl-C take
         # the fail-safe path above: hold, then disable torque.
-        _rest_return_eligible = True
+        _rest_return_eligible = session_result.clean_exit
     finally:
         # Close robot/CAN and V4L2 resources before any post-rollout
         # visualization work. A hung exporter must never retain the controller
         # or cameras after motion is over.
         _shutdown_runtime()
 
-    if saved_rollouts:
+    if session_result.saved_rollouts:
         print(
             "[rerun] raw rollouts are handed to the detached exporter after this "
             "launcher exits; each directory will receive an atomic rollout.rrd."

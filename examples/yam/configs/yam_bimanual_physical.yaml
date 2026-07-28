@@ -59,11 +59,11 @@ eval:
     # execution must be chosen explicitly on the command line.
     active_arm_side: both
     execution_mode: shadow
-    # Send valid absolute targets directly, matching the fast single-arm
-    # rollout behavior. The checkpoint action envelope and gripper aperture
-    # validation remain enabled; set a scalar or 14-D vector here only if a
-    # bounded per-tick target rate is desired again.
-    both_arm_max_delta: null
+    # Fast bimanual target bound. This is much faster than the earlier 0.03
+    # rad/tick cap, but prevents raw absolute policy targets from jumping both
+    # arms across the workspace in a single 30 Hz command tick. Fields 6 and
+    # 13 are normalized gripper apertures.
+    both_arm_max_delta: [0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.10, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.10]
   live_view_enabled: false
   # Return both arms to the encoder-measured pose at launcher startup only
   # after a normal, completed session. Faults and Ctrl-C never autonomously
