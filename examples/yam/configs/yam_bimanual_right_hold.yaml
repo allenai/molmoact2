@@ -1,6 +1,16 @@
-# This config must be supplied as --right-config-path for the BimanualYAM
-# model: state/action fields 7:14 are the physical right arm.
-model_arm_side: right
+# Primary configuration for the released MolmoAct2-BimanualYAM checkpoint.
+#
+# The checkpoint's state/action convention is fixed:
+#   fields 0:7  = physical left arm (can_left)
+#   fields 7:14 = physical right arm (can_right)
+#
+# Use this file with ``--right-config-path yam_right_primary.yaml``.  Its
+# default execution mode is ``shadow``: both arms receive their current
+# encoder positions, while the model still runs and records full 14-D policy
+# outputs.  That validates the cameras, state ordering, and right-arm action
+# half without intentionally moving either arm.  To perform the first active
+# right-arm test, add ``--execution-mode active_arm_hold`` explicitly.
+model_arm_side: left
 
 sensors:
   cameras:
@@ -11,31 +21,31 @@ sensors:
       # D435 serial 250423122040 (static overhead view / model ``top_cam``)
       device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_435_Intel_R__RealSense_TM__Depth_Camera_435_250423122040-video-index0"
     right_camera:
-      # D405 serial 402323071794 (right wrist view)
+      # D405 serial 402323071794 (right wrist view / model ``right_cam``)
       device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071794-video-index4"
 
 robot:
   _target_: gello_min.yam.YAMRobot
-  channel: can_right
+  channel: can_left
 
 agent:
   start_joints: null
 
 hz: 30
-# Full physical-task horizon: 3000 control steps at 30 Hz (~100 s of action
-# execution, plus replan pauses between 30-action chunks).
-max_steps: 3000
+# A 1,000-step run is roughly 33 s of commanded control time at 30 Hz.  The
+# policy replans in 30-action chunks, so wall time also includes inference.
+max_steps: 1000
 
 storage:
   base_dir: "./yam_eval_runs"
-  task_directory: "red_lid_right_arm"
+  task_directory: "red_lid_right_arm_bimanual"
   language_instruction: "Using the right arm, pick up the red lid, place it fully on top of the black box, open the gripper to release it, then move the arm away."
   saver_max_workers: 2
   png_compress_level: 1
 
 lerobot:
   fps: 30
-  robot_type: "molmoact_right_arm"
+  robot_type: "molmoact_bimanual_right_hold"
   hf_repo_id: "local/yam_eval_session"
   action_mode: "next_joint_fields"
   vcodec: "libx264"
@@ -45,7 +55,15 @@ lerobot:
   sanitize_online_viz_meta: true
 
 eval:
+  # Keep the model's native [left(7), right(7)] state/action interface.  The
+  # launcher only permits an explicit active arm and starts shadow-only.
+  bimanual:
+    active_arm_side: right
+    execution_mode: shadow
   live_view_enabled: false
+  reproducibility:
+    seed: 20260727
+    deterministic_algorithms: false
   # Gate motor enable on two well-exposed, correctly-sized policy frames.
   camera_preflight:
     enabled: true
@@ -54,8 +72,6 @@ eval:
     required_consecutive_frames: 2
     expected_shape: [360, 640, 3]
     max_clipped_white_fraction: 0.15
-  # A detached, camera/CAN-free exporter is armed before robot startup. After
-  # the launcher exits it atomically writes rollout.rrd from raw PNG/HDF5.
   rerun:
     enabled: true
     image_stride: 6
@@ -66,8 +82,6 @@ eval:
     repo_id: "allenai/MolmoAct2-BimanualYAM"
     device: "cuda:0"
     dtype: "bfloat16"
-    # Use the released checkpoint's quality default. Lowering this to five
-    # solver steps trades away action quality, not merely latency.
     num_steps: 10
     enable_cuda_graph: false
     warmup: true
