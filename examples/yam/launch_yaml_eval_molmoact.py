@@ -334,15 +334,50 @@ def wait_for_camera_visual_preflight(
     )
 
 
-def _close_cameras_after_failed_preflight(camera_dict: Dict[str, Any]) -> None:
-    """Best-effort resource release when camera validation aborts startup."""
+def _close_cameras_after_failed_startup(camera_dict: Dict[str, Any]) -> None:
+    """Best-effort camera release before an environment has been constructed."""
     for camera in camera_dict.values():
         close = getattr(camera, "close", None)
         if callable(close):
             try:
                 close()
             except Exception:  # noqa: BLE001 -- preserve preflight error
-                logger.debug("Camera close after failed preflight failed", exc_info=True)
+                logger.debug("Camera close after failed startup failed", exc_info=True)
+
+
+def _close_failed_build_resources(
+    *,
+    camera_dict: Optional[Dict[str, Any]],
+    camera_client: Optional[CameraClient],
+    left_robot: Optional[Any],
+    right_robot: Optional[Any],
+) -> None:
+    """Release resources if camera setup succeeded but robot setup did not.
+
+    ``_build_env`` opens camera capture threads before it opens either CAN
+    controller.  A motor-enable failure must not leave those threads or an
+    already-enabled primary arm alive until interpreter teardown.  This runs
+    only before ``RobotEnv`` exists, so each resource is closed directly and
+    all cleanup is best-effort to preserve the original startup exception.
+    """
+    for robot in (right_robot, left_robot):
+        close = getattr(robot, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 -- preserve the startup failure
+                logger.debug("Robot close after failed startup failed", exc_info=True)
+
+    if camera_client is not None:
+        close = getattr(camera_client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 -- preserve the startup failure
+                logger.debug("Camera client close after failed startup failed", exc_info=True)
+
+    if camera_dict is not None:
+        _close_cameras_after_failed_startup(camera_dict)
 
 
 def _build_env(
@@ -420,35 +455,46 @@ def _build_env(
                     min_warmup_sec=float(preflight_cfg.get("min_warmup_sec", 2.0)),
                 )
             except Exception:
-                _close_cameras_after_failed_preflight(camera_dict)
+                _close_cameras_after_failed_startup(camera_dict)
                 raise
 
-    left_robot_cfg = left_cfg["robot"]
-    if isinstance(left_robot_cfg.get("config"), str):
-        left_robot_cfg["config"] = OmegaConf.to_container(
-            OmegaConf.load(left_robot_cfg["config"]), resolve=True
-        )
-    print(f"Opening primary YAM robot on CAN channel: {left_robot_cfg.get('channel', '<unspecified>')}")
-    left_robot = instantiate_from_dict(left_robot_cfg)
-
-    if bimanual:
-        right_robot_cfg = right_cfg["robot"]
-        if isinstance(right_robot_cfg.get("config"), str):
-            right_robot_cfg["config"] = OmegaConf.to_container(
-                OmegaConf.load(right_robot_cfg["config"]), resolve=True
+    left_robot = None
+    right_robot = None
+    try:
+        left_robot_cfg = left_cfg["robot"]
+        if isinstance(left_robot_cfg.get("config"), str):
+            left_robot_cfg["config"] = OmegaConf.to_container(
+                OmegaConf.load(left_robot_cfg["config"]), resolve=True
             )
-        print(f"Opening secondary YAM robot on CAN channel: {right_robot_cfg.get('channel', '<unspecified>')}")
-        right_robot = instantiate_from_dict(right_robot_cfg)
-        robot = BimanualRobot(left_robot, right_robot)
-    else:
-        robot = left_robot
+        print(f"Opening primary YAM robot on CAN channel: {left_robot_cfg.get('channel', '<unspecified>')}")
+        left_robot = instantiate_from_dict(left_robot_cfg)
 
-    env = RobotEnv(
-        robot,
-        control_rate_hz=left_cfg.get("hz", 30),
-        camera_dict=camera_dict,
-        camera_client=camera_client,
-    )
+        if bimanual:
+            right_robot_cfg = right_cfg["robot"]
+            if isinstance(right_robot_cfg.get("config"), str):
+                right_robot_cfg["config"] = OmegaConf.to_container(
+                    OmegaConf.load(right_robot_cfg["config"]), resolve=True
+                )
+            print(f"Opening secondary YAM robot on CAN channel: {right_robot_cfg.get('channel', '<unspecified>')}")
+            right_robot = instantiate_from_dict(right_robot_cfg)
+            robot = BimanualRobot(left_robot, right_robot)
+        else:
+            robot = left_robot
+
+        env = RobotEnv(
+            robot,
+            control_rate_hz=left_cfg.get("hz", 30),
+            camera_dict=camera_dict,
+            camera_client=camera_client,
+        )
+    except Exception:
+        _close_failed_build_resources(
+            camera_dict=camera_dict,
+            camera_client=camera_client,
+            left_robot=left_robot,
+            right_robot=right_robot,
+        )
+        raise
     return env, left_cfg, right_cfg, bimanual
 
 

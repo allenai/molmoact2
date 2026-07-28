@@ -5,6 +5,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import h5py
@@ -529,6 +530,79 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertEqual(left.closed, 1)
         self.assertEqual(front.closed, 1)
         self.assertEqual(env._camera_dict, {})
+
+
+class BuildFailureCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _write_configs(root: Path) -> tuple[Path, Path]:
+        left = root / "left.yaml"
+        right = root / "right.yaml"
+        left.write_text(
+            """
+sensors:
+  cameras:
+    left_camera: {device_id: /dev/fake-left}
+    front_camera: {device_id: /dev/fake-front}
+    right_camera: {device_id: /dev/fake-right}
+eval:
+  camera_preflight: {enabled: true}
+robot:
+  channel: can_left
+""",
+            encoding="utf-8",
+        )
+        right.write_text(
+            """
+robot:
+  channel: can_right
+""",
+            encoding="utf-8",
+        )
+        return left, right
+
+    def test_primary_robot_startup_failure_closes_open_v4l2_cameras(self):
+        cameras = [_ClosableCamera(), _ClosableCamera(), _ClosableCamera()]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            left_cfg, right_cfg = self._write_configs(Path(temp_dir))
+            args = SimpleNamespace(
+                config_path=str(left_cfg), right_config_path=str(right_cfg)
+            )
+            with (
+                patch.object(launcher, "V4L2Camera", side_effect=cameras),
+                patch.object(launcher, "wait_for_camera_visual_preflight"),
+                patch.object(
+                    launcher,
+                    "instantiate_from_dict",
+                    side_effect=RuntimeError("motor 7 refused enable"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "motor 7 refused enable"):
+                    launcher._build_env(args)
+
+        self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
+
+    def test_secondary_robot_startup_failure_closes_primary_robot_and_cameras(self):
+        cameras = [_ClosableCamera(), _ClosableCamera(), _ClosableCamera()]
+        primary_robot = _ClosableRobot()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            left_cfg, right_cfg = self._write_configs(Path(temp_dir))
+            args = SimpleNamespace(
+                config_path=str(left_cfg), right_config_path=str(right_cfg)
+            )
+            with (
+                patch.object(launcher, "V4L2Camera", side_effect=cameras),
+                patch.object(launcher, "wait_for_camera_visual_preflight"),
+                patch.object(
+                    launcher,
+                    "instantiate_from_dict",
+                    side_effect=[primary_robot, RuntimeError("secondary CAN fault")],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "secondary CAN fault"):
+                    launcher._build_env(args)
+
+        self.assertEqual(primary_robot.closed, 1)
+        self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
 
 
 if __name__ == "__main__":
