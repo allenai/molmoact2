@@ -83,7 +83,11 @@ eval:
     device: "cuda:0"
     dtype: "bfloat16"
     num_steps: 10
-    enable_cuda_graph: false
+    # Thor supports this checkpoint's static CUDA-graph replay. After the
+    # one-time first-query capture, the measured policy latency falls below
+    # the 30-action (~1 s) execution window, avoiding the visible replan
+    # hold between action chunks.
+    enable_cuda_graph: true
     warmup: true
   camera_server:
     enabled: false
