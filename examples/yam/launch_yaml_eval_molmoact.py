@@ -148,6 +148,7 @@ _bimanual_execution_mask: Optional["BimanualActiveArmHoldMask"] = None
 _captured_rest_joints: Optional[np.ndarray] = None
 _return_to_captured_rest_on_exit: bool = False
 _return_to_rest_max_joint_step: float = 0.01
+_rest_return_eligible: bool = False
 
 
 def capture_rest_pose_at_startup(
@@ -167,9 +168,14 @@ def capture_rest_pose_at_startup(
     """
     global _captured_rest_joints, _return_to_captured_rest_on_exit
     global _return_to_rest_max_joint_step
+    global _rest_return_eligible
 
     _captured_rest_joints = None
     _return_to_captured_rest_on_exit = bool(enabled)
+    # A shutdown caused by Ctrl-C, a CAN/control fault, or policy error must
+    # hold and disable the robot rather than initiating a new autonomous path.
+    # ``main`` flips this only after run_session() returns normally.
+    _rest_return_eligible = False
     if not _return_to_captured_rest_on_exit:
         return
     if not np.isfinite(max_joint_step) or max_joint_step <= 0.0:
@@ -264,6 +270,11 @@ def _park_robot() -> None:
     _park_done = True
     try:
         if _return_to_captured_rest_on_exit:
+            if not _rest_return_eligible:
+                logger.info(
+                    "Skipping captured rest return because the rollout did not complete normally"
+                )
+                return
             if _captured_rest_joints is None:
                 raise RuntimeError("No startup rest pose was captured")
             print("Returning robot to its captured startup rest pose...")
@@ -761,8 +772,8 @@ class BimanualActiveArmHoldMask:
     passive displacement of the inactive arm. In explicit ``both`` mode, a
     native 14-D target is checked against the released checkpoint's absolute
     action envelope before it is sent. An optional per-tick cap can be enabled
-    by configuration, but the physical bimanual config deliberately uses the
-    direct-target path to match single-arm execution.
+    by configuration, but the physical bimanual config uses the direct-target
+    path to match single-arm execution.
 
     ``shadow`` is deliberately stronger: it replaces both halves with live
     feedback so that a policy rollout can be inspected without intentionally
@@ -1389,6 +1400,7 @@ def run_session(
 
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     labeled_rollouts: List[Path] = []
+    global _rest_return_eligible
     saved_rollouts: List[Path] = []
     saver: Optional[EvalRolloutSaver] = None
     outcome: Optional[RolloutOutcome] = None
@@ -1560,6 +1572,8 @@ def _convert_if_any(
 
 
 def main() -> None:
+    global _rest_return_eligible
+
     # Fallback only. The explicit ``finally`` below is the normal shutdown
     # path because Python waits for the robot's non-daemon server thread before
     # running atexit handlers.
@@ -1689,6 +1703,10 @@ def main() -> None:
             secondary_config_path=args.right_config_path,
             process_seed_metadata=process_seed_metadata,
         )
+        # A known-complete session is the only condition under which teardown
+        # may move the robot back to its captured pose. Faults and Ctrl-C take
+        # the fail-safe path above: hold, then disable torque.
+        _rest_return_eligible = True
     finally:
         # Close robot/CAN and V4L2 resources before any post-rollout
         # visualization work. A hung exporter must never retain the controller

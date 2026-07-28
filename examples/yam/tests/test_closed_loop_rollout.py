@@ -1,5 +1,6 @@
 """Hardware-free regressions for the physical YAM rollout adapter."""
 
+import json
 import threading
 import time
 import tempfile
@@ -536,6 +537,53 @@ class RolloutRecordingTests(unittest.TestCase):
             self.assertTrue(rrd_path.is_file())
             self.assertGreater(rrd_path.stat().st_size, 0)
 
+    def test_long_rollout_streams_camera_frames_with_bounded_staging(self):
+        """Long runs retain telemetry, not thousands of RGB arrays in RAM."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout_dir = Path(temp_dir) / "rollout"
+            saver = EvalRolloutSaver(
+                rollout_dir,
+                instruction="bounded camera staging",
+                max_workers=1,
+                max_pending_image_tasks=2,
+            )
+            image = np.full((8, 10, 3), 17, dtype=np.uint8)
+            num_steps = 256
+            for step in range(num_steps):
+                state = np.full(7, float(step), dtype=np.float32)
+                saver.add_step(
+                    obs_pre={"joint_positions": state, "left_camera_rgb": image},
+                    obs_post={"joint_positions": state + 0.1},
+                    action=state + 0.2,
+                )
+                self.assertLessEqual(saver.pending_image_tasks, 2)
+
+            # The numeric records are intentionally retained for atomic HDF5
+            # publication, but not one RGB ndarray per control step.
+            self.assertEqual(saver.num_steps, num_steps)
+            self.assertTrue(all("left_rgb" not in record for record in saver._buffer))
+            self.assertEqual(set(saver._last_camera_frame), {"left_rgb"})
+
+            saver.flush()
+
+            with h5py.File(rollout_dir / "episode.h5", "r") as h5:
+                self.assertEqual(h5["state"].shape, (num_steps, 7))
+                self.assertEqual(h5["action"].shape, (num_steps, 7))
+                self.assertEqual(json.loads(h5.attrs["camera_frame_counts"]), {"left_rgb": num_steps})
+
+            # Every historical per-step path remains available for Rerun and
+            # LeRobot conversion, while duplicate latest-frame cache reads are
+            # hard-linked instead of recompressed into separate image buffers.
+            first_path = rollout_dir / "left_rgb" / "000000.png"
+            last_path = rollout_dir / "left_rgb" / f"{num_steps - 1:06d}.png"
+            self.assertTrue(first_path.is_file())
+            self.assertTrue(last_path.is_file())
+            self.assertEqual(first_path.stat().st_ino, last_path.stat().st_ino)
+
+            rrd_path = write_rollout_rrd(rollout_dir, image_stride=32, jpeg_quality=70)
+            self.assertTrue(rrd_path.is_file())
+            self.assertGreater(rrd_path.stat().st_size, 0)
+
     def test_missing_last_camera_frame_preserves_hdf5_and_full_replay(self):
         """One camera hiccup must not discard every other saved artifact."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -571,21 +619,20 @@ class RolloutRecordingTests(unittest.TestCase):
             self.assertGreater(rrd_path.stat().st_size, 0)
 
     def test_hdf5_is_published_before_png_compression_failure(self):
-        """An interrupted/failed image flush must retain full action telemetry."""
+        """A streamed camera-write failure must retain full action telemetry."""
         with tempfile.TemporaryDirectory() as temp_dir:
             rollout_dir = Path(temp_dir) / "rollout"
             saver = EvalRolloutSaver(rollout_dir, instruction="publish telemetry first")
             image = np.full((8, 10, 3), 61, dtype=np.uint8)
-            saver.add_step(
-                obs_pre={
-                    "joint_positions": np.zeros(7, dtype=np.float32),
-                    "left_camera_rgb": image,
-                },
-                obs_post={"joint_positions": np.ones(7, dtype=np.float32)},
-                action=np.full(7, 0.25, dtype=np.float32),
-            )
-
             with patch("eval_utils._save_png", side_effect=RuntimeError("simulated png failure")):
+                saver.add_step(
+                    obs_pre={
+                        "joint_positions": np.zeros(7, dtype=np.float32),
+                        "left_camera_rgb": image,
+                    },
+                    obs_post={"joint_positions": np.ones(7, dtype=np.float32)},
+                    action=np.full(7, 0.25, dtype=np.float32),
+                )
                 with self.assertRaisesRegex(RuntimeError, "simulated png failure"):
                     saver.flush()
 
