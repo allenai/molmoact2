@@ -145,23 +145,138 @@ _right_cfg: Optional[Dict[str, Any]] = None
 _park_done: bool = False
 _resources_closed: bool = False
 _bimanual_execution_mask: Optional["BimanualActiveArmHoldMask"] = None
+_captured_rest_joints: Optional[np.ndarray] = None
+_return_to_captured_rest_on_exit: bool = False
+_return_to_rest_max_joint_step: float = 0.01
+
+
+def capture_rest_pose_at_startup(
+    env: RobotEnv,
+    *,
+    enabled: bool,
+    max_joint_step: float = 0.01,
+) -> None:
+    """Capture live encoder positions for an optional orderly return on exit.
+
+    Physical rollout configs intentionally do not hard-code a universal
+    neutral pose: the safe neutral pose depends on how each real arm was
+    installed.  When enabled, treat the encoder-measured pose at launcher
+    startup as the session's rest pose instead.  A later return therefore
+    never invents a joint configuration that has not already been verified
+    physically by the operator.
+    """
+    global _captured_rest_joints, _return_to_captured_rest_on_exit
+    global _return_to_rest_max_joint_step
+
+    _captured_rest_joints = None
+    _return_to_captured_rest_on_exit = bool(enabled)
+    if not _return_to_captured_rest_on_exit:
+        return
+    if not np.isfinite(max_joint_step) or max_joint_step <= 0.0:
+        raise ValueError("eval.return_to_rest_max_joint_step must be finite and positive")
+
+    get_robot_state = getattr(env, "get_robot_state", None)
+    if not callable(get_robot_state):
+        raise RuntimeError("Cannot capture rest pose: rollout environment lacks get_robot_state()")
+    state = get_robot_state()
+    joints = np.asarray(state.get("joint_positions"), dtype=np.float32).reshape(-1)
+    expected_dofs = int(env.robot().num_dofs())
+    if joints.shape != (expected_dofs,) or not np.isfinite(joints).all():
+        raise RuntimeError(
+            "Cannot capture rest pose: invalid encoder joint positions "
+            f"shape={joints.shape}, expected ({expected_dofs},)"
+        )
+    _captured_rest_joints = joints.copy()
+    _return_to_rest_max_joint_step = float(max_joint_step)
+    logger.info(
+        "Captured %d-DoF encoder rest pose for orderly shutdown return "
+        "(max step %.4f)",
+        expected_dofs,
+        _return_to_rest_max_joint_step,
+    )
+
+
+def return_to_captured_rest_pose(
+    env: RobotEnv,
+    rest_joints: Any,
+    *,
+    max_joint_step: float,
+) -> None:
+    """Slowly command an already-verified rest pose without rereading cameras.
+
+    This is deliberately a robot-only path: shutdown should not depend on
+    V4L2 availability.  It uses fresh feedback and bounded interpolation, and
+    raises instead of moving if control health or joint dimensions are wrong.
+    """
+    get_robot_state = getattr(env, "get_robot_state", None)
+    step_command_only = getattr(env, "step_command_only", None)
+    if not callable(get_robot_state) or not callable(step_command_only):
+        raise RuntimeError(
+            "Cannot return to rest pose: rollout environment lacks robot-only "
+            "feedback or command API"
+        )
+    if not np.isfinite(max_joint_step) or max_joint_step <= 0.0:
+        raise ValueError("max_joint_step must be finite and positive")
+
+    target = np.asarray(rest_joints, dtype=np.float32).reshape(-1)
+    current = np.asarray(
+        get_robot_state().get("joint_positions"), dtype=np.float32
+    ).reshape(-1)
+    expected_dofs = int(env.robot().num_dofs())
+    if (
+        target.shape != (expected_dofs,)
+        or current.shape != (expected_dofs,)
+        or not np.isfinite(target).all()
+        or not np.isfinite(current).all()
+    ):
+        raise RuntimeError(
+            "Cannot return to rest pose: invalid encoder/target dimensions "
+            f"current={current.shape}, target={target.shape}, expected=({expected_dofs},)"
+        )
+
+    max_delta = float(np.max(np.abs(target - current)))
+    if max_delta == 0.0:
+        return
+    # A captured physical pose should always be reachable in a few hundred
+    # ticks. Treat an implausibly large feedback discontinuity as a fault,
+    # rather than issuing a long unexpected motion during teardown.
+    steps = int(np.ceil(max_delta / max_joint_step))
+    if steps > 600:
+        raise RuntimeError(
+            "Refusing rest return after implausibly large encoder displacement "
+            f"({max_delta:.3f} rad/aperture; {steps} bounded steps required)"
+        )
+
+    logger.info(
+        "Returning robot to captured rest pose over %d bounded control steps", steps
+    )
+    for joints in np.linspace(current, target, steps + 1, dtype=np.float32)[1:]:
+        # reset=True bypasses teleoperation offsets; this is a physical joint
+        # target captured from the same robot at launcher startup.
+        step_command_only(joints, reset=True)
 
 
 def _park_robot() -> None:
-    """Best-effort optional move to configured start joints before shutdown."""
+    """Best-effort orderly return before motor shutdown."""
     global _park_done
     if _park_done or _env is None:
         return
     _park_done = True
-    if _bimanual_execution_mask is not None:
-        # In active-arm-hold and shadow modes, an implicit park target would
-        # move the supposedly inactive arm during teardown.  Leave both arms
-        # at their final measured positions; the regular close path then
-        # disables their motor-control loops.
-        logger.info("Skipping implicit park in bimanual active-arm hold mode")
-        return
-    print("Parking robot at start position...")
     try:
+        if _return_to_captured_rest_on_exit:
+            if _captured_rest_joints is None:
+                raise RuntimeError("No startup rest pose was captured")
+            print("Returning robot to its captured startup rest pose...")
+            return_to_captured_rest_pose(
+                _env,
+                _captured_rest_joints,
+                max_joint_step=_return_to_rest_max_joint_step,
+            )
+            return
+        if _bimanual_execution_mask is not None:
+            logger.info("Skipping implicit config park in bimanual execution mode")
+            return
+        print("Parking robot at start position...")
         if _bimanual:
             move_to_start_position(_env, True, _left_cfg, _right_cfg)
         else:
@@ -644,8 +759,10 @@ class BimanualActiveArmHoldMask:
     the latest encoder feedback just before each command is sent. Holding from
     fresh feedback (rather than an old start pose) avoids fighting a small
     passive displacement of the inactive arm. In explicit ``both`` mode, a
-    native 14-D target is rejected on a large discontinuity and otherwise
-    rate-bounded around fresh feedback before it is sent.
+    native 14-D target is checked against the released checkpoint's absolute
+    action envelope before it is sent. An optional per-tick cap can be enabled
+    by configuration, but the physical bimanual config deliberately uses the
+    direct-target path to match single-arm execution.
 
     ``shadow`` is deliberately stronger: it replaces both halves with live
     feedback so that a policy rollout can be inspected without intentionally
@@ -657,9 +774,10 @@ class BimanualActiveArmHoldMask:
 
     state_dim: int = 14
     arm_dim: int = 7
-    # Required only for active both-arm execution. A scalar expands to all
-    # fields; a 14-D vector lets gripper aperture use a different bound from
-    # arm-joint radians.
+    # Optional per-tick target cap. A scalar expands to all fields; a 14-D
+    # vector lets gripper aperture use a different bound from arm-joint
+    # radians. ``None`` sends valid absolute targets directly, matching the
+    # original active single-arm behavior.
     both_arm_max_delta: Optional[Any] = None
     # Absolute target envelope from the released checkpoint's documented
     # q01/q99 output bounds. This is intentionally distinct from a maximum
@@ -679,11 +797,13 @@ class BimanualActiveArmHoldMask:
                 f"{self.execution_mode!r}"
             )
         if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
-            max_delta = _coerce_bimanual_delta_limit(
-                self.both_arm_max_delta,
-                name="both_arm_max_delta",
-                state_dim=self.state_dim,
-            )
+            max_delta = None
+            if self.both_arm_max_delta is not None:
+                max_delta = _coerce_bimanual_delta_limit(
+                    self.both_arm_max_delta,
+                    name="both_arm_max_delta",
+                    state_dim=self.state_dim,
+                )
             action_lower = _coerce_bimanual_action_bound(
                 self.both_arm_action_lower,
                 name="both_arm_action_lower",
@@ -745,6 +865,8 @@ class BimanualActiveArmHoldMask:
         if self.execution_mode == "shadow":
             return "both arms held from live encoder feedback (shadow)"
         if self.active_arm_side == "both":
+            if self.both_arm_max_delta is None:
+                return "both native policy halves enabled with direct targets and target envelope"
             return "both native policy halves enabled with target envelope and rate limit"
         return f"{self.active_arm_side} policy half enabled; opposite arm held from live feedback"
 
@@ -763,9 +885,15 @@ class BimanualActiveArmHoldMask:
         }
         if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
             result["both_arm_rate_limit"] = {
-                "max_delta": np.asarray(self.both_arm_max_delta).tolist(),
-                "reference": "fresh_encoder_feedback_each_tick",
+                "enabled": self.both_arm_max_delta is not None,
             }
+            if self.both_arm_max_delta is not None:
+                result["both_arm_rate_limit"].update(
+                    {
+                        "max_delta": np.asarray(self.both_arm_max_delta).tolist(),
+                        "reference": "fresh_encoder_feedback_each_tick",
+                    }
+                )
             result["both_arm_target_envelope"] = {
                 "lower": np.asarray(self.both_arm_action_lower).tolist(),
                 "upper": np.asarray(self.both_arm_action_upper).tolist(),
@@ -825,6 +953,8 @@ class BimanualActiveArmHoldMask:
                         "Bimanual action guard rejected an out-of-envelope "
                         f"absolute target ({details}{suffix}); no target was sent."
                     )
+                if self.both_arm_max_delta is None:
+                    return action.astype(np.float32, copy=True)
                 delta = action - measured
                 max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
                 command = measured + np.clip(delta, -max_delta, max_delta)
@@ -936,6 +1066,61 @@ def dynamic_smoothing(env: RobotEnv, target_joints: np.ndarray) -> Dict[str, Any
     return env.get_robot_state()
 
 
+_ROBOT_OBSERVATION_KEYS = (
+    "joint_positions",
+    "joint_velocities",
+    "ee_pos_quat",
+    "gripper_position",
+)
+
+
+def refresh_robot_feedback_after_inference(
+    env: RobotEnv,
+    policy_observation: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the policy frame snapshot with feedback refreshed for command time.
+
+    Inference takes substantially longer than one motor-control tick.  The
+    RGB frames and joint state in ``policy_observation`` must remain paired as
+    the model input, but using that old state as the *command* rate-limit
+    reference would make the first absolute target after an inference pause
+    stale.  Read only the robot feedback immediately before that command;
+    do not call ``get_obs`` here, because that would perform an unnecessary
+    second three-camera read at every policy boundary.
+
+    The returned observation deliberately retains the exact camera frames
+    used for the policy query and replaces only robot fields.  This makes the
+    saved step state the encoder feedback immediately preceding the applied
+    command, which is the state needed to interpret the target/action replay.
+    """
+    get_robot_state = getattr(env, "get_robot_state", None)
+    if not callable(get_robot_state):
+        raise RuntimeError(
+            "Rollout environment must provide get_robot_state() so encoder "
+            "feedback can be refreshed after policy inference without rereading cameras."
+        )
+    fresh_robot = get_robot_state()
+    missing = [key for key in _ROBOT_OBSERVATION_KEYS if key not in fresh_robot]
+    if missing:
+        raise RuntimeError(
+            "Robot-only feedback after policy inference is missing required fields: "
+            f"{missing}"
+        )
+
+    expected_dofs = int(env.robot().num_dofs())
+    joint_positions = np.asarray(fresh_robot["joint_positions"], dtype=np.float32).reshape(-1)
+    if joint_positions.shape != (expected_dofs,):
+        raise RuntimeError(
+            "Robot-only feedback after policy inference has invalid joint position shape: "
+            f"{joint_positions.shape}, expected ({expected_dofs},)"
+        )
+
+    refreshed = dict(policy_observation)
+    for key in _ROBOT_OBSERVATION_KEYS:
+        refreshed[key] = fresh_robot[key]
+    return refreshed
+
+
 def run_one_rollout(
     env: RobotEnv,
     policy: MolmoAct,
@@ -1024,6 +1209,14 @@ def run_one_rollout(
                 inference_sec=policy_inference_sec,
                 metadata=policy_inference_metadata,
             )
+
+            # ``obs_pre`` is the exact RGB/state snapshot supplied to the
+            # model.  It is now old by the inference duration, so refresh
+            # only encoder-derived fields before the first target in this
+            # new chunk.  In particular, do not reread V4L2 cameras here:
+            # cached frames already decoupled camera capture from control.
+            obs_pre = refresh_robot_feedback_after_inference(env, obs_pre)
+
             logger.info(
                 "Fresh action plan at rollout step %d: %d absolute-pose actions",
                 step + 1,
@@ -1463,6 +1656,11 @@ def main() -> None:
 
     saved_rollouts: List[Path] = []
     try:
+        capture_rest_pose_at_startup(
+            env,
+            enabled=bool(eval_cfg.get("return_to_rest_on_exit", False)),
+            max_joint_step=float(eval_cfg.get("return_to_rest_max_joint_step", 0.01)),
+        )
         move_to_rollout_start(
             env,
             bimanual=bimanual,

@@ -30,7 +30,10 @@ agent:
   start_joints: null
 
 hz: 30
-max_steps: 1000
+# Full cloth-manipulation horizon. At 30 Hz this permits about 167 seconds of
+# commanded motion; CUDA-graph replay minimizes the replan gaps between chunks.
+# Ctrl-C safely saves the partial rollout if the task ends earlier.
+max_steps: 5000
 
 storage:
   base_dir: "./yam_eval_runs"
@@ -56,12 +59,17 @@ eval:
     # execution must be chosen explicitly on the command line.
     active_arm_side: both
     execution_mode: shadow
-    # At 30 Hz: clamp each absolute target advance to 0.03 rad / aperture per
-    # tick. The launcher separately rejects raw targets outside the released
-    # checkpoint's documented absolute-pose action envelope; it must not
-    # reject a valid target merely because it is far from current feedback.
-    both_arm_max_delta: 0.03
+    # Send valid absolute targets directly, matching the fast single-arm
+    # rollout behavior. The checkpoint action envelope and gripper aperture
+    # validation remain enabled; set a scalar or 14-D vector here later only
+    # if a bounded per-tick target rate is desired again.
+    both_arm_max_delta: null
   live_view_enabled: false
+  # Return both arms to the encoder-measured pose at launcher startup after
+  # a normal/controlled exit. This is intentionally not a hard-coded neutral
+  # pose: start the script from the pose you want to restore.
+  return_to_rest_on_exit: true
+  return_to_rest_max_joint_step: 0.01
   reproducibility:
     seed: 20260727
     deterministic_algorithms: false

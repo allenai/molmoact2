@@ -31,6 +31,7 @@ class _OneDofEnv:
     def __init__(self):
         self.position = np.array([0.0], dtype=np.float32)
         self._robot = _OneDofRobot()
+        self.commanded = []
 
     def robot(self):
         return self._robot
@@ -42,6 +43,17 @@ class _OneDofEnv:
             "ee_pos_quat": np.zeros(7, dtype=np.float32),
             "gripper_position": np.zeros(1, dtype=np.float32),
         }
+
+    def get_robot_state(self):
+        # Match RobotEnv's camera-free feedback API.  Tests use this to prove
+        # the first command after inference is based on current encoders
+        # without incurring a second camera observation.
+        return self.get_obs()
+
+    def step_command_only(self, joints, reset=False, wait=True):
+        command = np.asarray(joints, dtype=np.float32).copy()
+        self.commanded.append((command, bool(reset), bool(wait)))
+        self.position = command
 
 
 class _Policy:
@@ -90,6 +102,36 @@ class _FourteenDofEnv:
         return self._robot
 
     def get_obs(self):
+        return {
+            "joint_positions": self.position.copy(),
+            "joint_velocities": np.zeros(14, dtype=np.float32),
+            "ee_pos_quat": np.zeros(14, dtype=np.float32),
+            "gripper_position": np.array([self.position[6], self.position[13]]),
+        }
+
+    def get_robot_state(self):
+        return self.get_obs()
+
+
+class _PostInferenceFeedbackEnv(_FourteenDofEnv):
+    """Fake feedback that changes while a policy query is in flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_obs_calls = 0
+        self.get_robot_state_calls = 0
+        self.post_inference_position = np.full(14, 0.5, dtype=np.float32)
+
+    def get_obs(self):
+        self.get_obs_calls += 1
+        return super().get_obs()
+
+    def get_robot_state(self):
+        self.get_robot_state_calls += 1
+        # Simulate encoder feedback at command time, after the query has
+        # blocked.  Do not increment get_obs_calls: this is explicitly the
+        # robot-only API, not a camera read.
+        self.position = self.post_inference_position.copy()
         return {
             "joint_positions": self.position.copy(),
             "joint_velocities": np.zeros(14, dtype=np.float32),
@@ -265,6 +307,39 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "out-of-envelope absolute target"):
             mask.command_target(action, measured)
 
+    def test_bimanual_both_arm_guard_sends_direct_valid_targets_without_rate_limit(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.zeros(14, dtype=np.float32)
+        # This is intentionally much farther than the former 0.03/tick cap,
+        # while still inside the released checkpoint's absolute envelope.
+        action[2] = 0.523
+
+        applied = mask.command_target(action, measured)
+        np.testing.assert_array_equal(applied, action)
+        metadata = mask.manifest_metadata()["both_arm_rate_limit"]
+        self.assertFalse(metadata["enabled"])
+        self.assertNotIn("max_delta", metadata)
+
+    def test_return_to_captured_rest_pose_uses_bounded_robot_only_commands(self):
+        env = _OneDofEnv()
+        env.position = np.array([0.025], dtype=np.float32)
+
+        launcher.return_to_captured_rest_pose(
+            env,
+            np.array([0.0], dtype=np.float32),
+            max_joint_step=0.01,
+        )
+
+        self.assertEqual(len(env.commanded), 3)
+        self.assertTrue(all(reset for _command, reset, _wait in env.commanded))
+        np.testing.assert_allclose(env.commanded[-1][0], [0.0])
+        commands = np.asarray([command[0] for command, _reset, _wait in env.commanded])
+        self.assertLessEqual(np.max(np.abs(np.diff(np.r_[0.025, commands]))), 0.01 + 1e-6)
+
     def test_bimanual_both_arm_shadow_never_needs_delta_guard(self):
         mask = launcher.BimanualActiveArmHoldMask(
             active_arm_side="both", execution_mode="shadow"
@@ -272,6 +347,57 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         measured = np.arange(14, dtype=np.float32)
         model_action = np.full(14, 123.0, dtype=np.float32)
         np.testing.assert_array_equal(mask.command_target(model_action, measured), measured)
+
+    def test_first_command_after_inference_refreshes_robot_feedback_without_camera_read(self):
+        env = _PostInferenceFeedbackEnv()
+        saver = _Saver()
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+            both_arm_max_delta=0.03,
+        )
+
+        class _ZeroTargetPolicy:
+            def prepare_input(self, obs, _instruction):
+                # The policy must retain the state paired with its original
+                # image snapshot; it is intentionally not given the later
+                # command-time encoder feedback.
+                self.policy_input_state = np.asarray(obs["joint_positions"]).copy()
+                return obs
+
+            def inference(self, _input):
+                return {"actions": np.zeros((1, 14), dtype=np.float32)}
+
+        policy = _ZeroTargetPolicy()
+        applied = []
+
+        def apply_action(fake_env, action):
+            applied.append(np.asarray(action, dtype=np.float32).copy())
+            fake_env.position = np.asarray(action, dtype=np.float32).copy()
+            return fake_env.get_obs()
+
+        with patch.object(launcher, "dynamic_smoothing", side_effect=apply_action):
+            launcher.run_one_rollout(
+                env=env,
+                policy=policy,
+                saver=saver,
+                instruction="test",
+                rollout_idx=0,
+                num_rollouts=1,
+                max_steps=1,
+                live_view=_LiveView(),
+                execution_mask=mask,
+            )
+
+        # The model saw the initial live state, while the ±0.03 guard used
+        # feedback sampled after inference: target zero from q=0.5 becomes
+        # q=0.47, not q=0.0.  The recorded state likewise reflects the
+        # encoder feedback immediately before the applied command.
+        np.testing.assert_allclose(policy.policy_input_state, np.arange(14, dtype=np.float32))
+        np.testing.assert_allclose(applied[0], np.full(14, 0.47, dtype=np.float32))
+        np.testing.assert_allclose(saver.steps[0]["obs_pre"]["joint_positions"], np.full(14, 0.5, dtype=np.float32))
+        self.assertEqual(env.get_obs_calls, 2)  # one policy frame + one fake post-command read
+        self.assertEqual(env.get_robot_state_calls, 1)
 
     def test_bimanual_execution_requires_explicit_side_and_order(self):
         with self.assertRaisesRegex(ValueError, "requires --active-arm-side"):
@@ -288,13 +414,13 @@ class ClosedLoopRolloutTests(unittest.TestCase):
                 active_arm_side="both",
                 execution_mode="active_arm_hold",
             )
-        with self.assertRaisesRegex(ValueError, "both_arm_max_delta"):
-            launcher.resolve_bimanual_execution_mask(
-                bimanual=True,
-                active_arm_side="both",
-                execution_mode="active_arm_hold",
-                both_arm_active_cli_confirmed=True,
-            )
+        direct_mask = launcher.resolve_bimanual_execution_mask(
+            bimanual=True,
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+            both_arm_active_cli_confirmed=True,
+        )
+        self.assertIsNone(direct_mask.both_arm_max_delta)
         dual_mask = launcher.resolve_bimanual_execution_mask(
             bimanual=True,
             active_arm_side="both",
