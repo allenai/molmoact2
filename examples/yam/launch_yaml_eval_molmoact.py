@@ -62,6 +62,71 @@ logger.setLevel(logging.INFO)
 DEVICE = os.environ.get("LEROBOT_TEST_DEVICE", "cuda") if torch.cuda.is_available() else "cpu"
 
 
+# The released ``allenai/MolmoAct2-BimanualYAM`` checkpoint declares
+# ``norm_mode: q01_q99`` for its 14-D absolute-pose action space. Its action
+# decoder clips every arm-joint field to that documented q01/q99 interval
+# before unnormalizing. Gripper fields are deliberately not normalized by the
+# checkpoint and remain normalized apertures, so their policy safety envelope
+# stays [-0.05, 1.05].
+#
+# These are *absolute target* bounds, not maximum distances from the current
+# encoder pose. A valid absolute target can be far from the current pose (for
+# example while moving toward a workspace object); per-tick speed is limited
+# separately by ``both_arm_max_delta`` below. A small 0.05-rad margin absorbs
+# numerical/version differences while staying inside the physical YAM joint
+# limits.
+_BIMANUAL_YAM_ACTION_Q01: Tuple[float, ...] = (
+    -0.6603105582072047,
+    0.0041340051935240115,
+    0.013831665477596221,
+    -1.3744044717113109,
+    -0.3593570239425977,
+    -0.9302641712677729,
+    0.051016362361406005,
+    -0.49367228465810536,
+    0.004744360313868616,
+    0.017154297804418434,
+    -1.4240273823045295,
+    -0.9737084779331572,
+    -0.4719268433374943,
+    0.033350514024370274,
+)
+_BIMANUAL_YAM_ACTION_Q99: Tuple[float, ...] = (
+    0.4704245731743921,
+    2.244327078820327,
+    2.0080105207169177,
+    0.13399061379118773,
+    0.8834156417282395,
+    0.334483290041328,
+    0.987078674113364,
+    0.7377501348730936,
+    2.285076596429336,
+    2.0605540868103542,
+    0.23968854170206916,
+    0.5304791687465945,
+    0.9621494841801348,
+    0.9953596816858612,
+)
+_BIMANUAL_YAM_ACTION_ENVELOPE_MARGIN = 0.05
+_BIMANUAL_YAM_GRIPPER_INDICES = frozenset((6, 13))
+BIMANUAL_YAM_ACTION_LOWER: Tuple[float, ...] = tuple(
+    -0.05
+    if index in _BIMANUAL_YAM_GRIPPER_INDICES
+    else value - _BIMANUAL_YAM_ACTION_ENVELOPE_MARGIN
+    for index, value in enumerate(_BIMANUAL_YAM_ACTION_Q01)
+)
+BIMANUAL_YAM_ACTION_UPPER: Tuple[float, ...] = tuple(
+    1.05
+    if index in _BIMANUAL_YAM_GRIPPER_INDICES
+    else value + _BIMANUAL_YAM_ACTION_ENVELOPE_MARGIN
+    for index, value in enumerate(_BIMANUAL_YAM_ACTION_Q99)
+)
+BIMANUAL_YAM_ACTION_ENVELOPE_SOURCE = (
+    "allenai/MolmoAct2-BimanualYAM norm_stats.json "
+    "yam_dual_molmoact2 action_stats.q01/q99, with 0.05-rad arm margin"
+)
+
+
 class _DisabledCamera:
     """Camera placeholder that preserves the model's three-image input shape."""
 
@@ -550,6 +615,24 @@ def _coerce_bimanual_delta_limit(
     return result
 
 
+def _coerce_bimanual_action_bound(
+    value: Any,
+    *,
+    name: str,
+    state_dim: int,
+) -> np.ndarray:
+    """Normalize a native 14-D absolute-policy target envelope bound."""
+    result = np.asarray(value, dtype=np.float32).reshape(-1)
+    if result.shape != (state_dim,):
+        raise ValueError(
+            f"{name} must be a {state_dim}-D [left(7), right(7)] vector, "
+            f"got {result.shape}"
+        )
+    if not np.isfinite(result).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return result
+
+
 @dataclass(frozen=True)
 class BimanualActiveArmHoldMask:
     """Safely select which halves of a 14-DoF BimanualYAM plan may execute.
@@ -574,11 +657,15 @@ class BimanualActiveArmHoldMask:
 
     state_dim: int = 14
     arm_dim: int = 7
-    # Required only for active both-arm execution.  A scalar expands to all
+    # Required only for active both-arm execution. A scalar expands to all
     # fields; a 14-D vector lets gripper aperture use a different bound from
     # arm-joint radians.
     both_arm_max_delta: Optional[Any] = None
-    both_arm_reject_delta: Optional[Any] = None
+    # Absolute target envelope from the released checkpoint's documented
+    # q01/q99 output bounds. This is intentionally distinct from a maximum
+    # target-minus-feedback distance: the policy predicts absolute poses.
+    both_arm_action_lower: Any = BIMANUAL_YAM_ACTION_LOWER
+    both_arm_action_upper: Any = BIMANUAL_YAM_ACTION_UPPER
 
     def __post_init__(self) -> None:
         if self.active_arm_side not in {"left", "right", "both"}:
@@ -597,18 +684,24 @@ class BimanualActiveArmHoldMask:
                 name="both_arm_max_delta",
                 state_dim=self.state_dim,
             )
-            reject_delta = _coerce_bimanual_delta_limit(
-                self.both_arm_reject_delta,
-                name="both_arm_reject_delta",
+            action_lower = _coerce_bimanual_action_bound(
+                self.both_arm_action_lower,
+                name="both_arm_action_lower",
                 state_dim=self.state_dim,
             )
-            if np.any(reject_delta < max_delta):
+            action_upper = _coerce_bimanual_action_bound(
+                self.both_arm_action_upper,
+                name="both_arm_action_upper",
+                state_dim=self.state_dim,
+            )
+            if np.any(action_lower >= action_upper):
                 raise ValueError(
-                    "eval.bimanual.both_arm_reject_delta must be at least "
-                    "both_arm_max_delta for every field"
+                    "both_arm_action_lower must be strictly below "
+                    "both_arm_action_upper for every field"
                 )
             object.__setattr__(self, "both_arm_max_delta", max_delta)
-            object.__setattr__(self, "both_arm_reject_delta", reject_delta)
+            object.__setattr__(self, "both_arm_action_lower", action_lower)
+            object.__setattr__(self, "both_arm_action_upper", action_upper)
 
     @property
     def active_slice(self) -> slice:
@@ -652,7 +745,7 @@ class BimanualActiveArmHoldMask:
         if self.execution_mode == "shadow":
             return "both arms held from live encoder feedback (shadow)"
         if self.active_arm_side == "both":
-            return "both native policy halves enabled with delta guard"
+            return "both native policy halves enabled with target envelope and rate limit"
         return f"{self.active_arm_side} policy half enabled; opposite arm held from live feedback"
 
     def manifest_metadata(self) -> Dict[str, Any]:
@@ -669,10 +762,15 @@ class BimanualActiveArmHoldMask:
             ),
         }
         if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
-            result["both_arm_delta_guard"] = {
+            result["both_arm_rate_limit"] = {
                 "max_delta": np.asarray(self.both_arm_max_delta).tolist(),
-                "reject_delta": np.asarray(self.both_arm_reject_delta).tolist(),
                 "reference": "fresh_encoder_feedback_each_tick",
+            }
+            result["both_arm_target_envelope"] = {
+                "lower": np.asarray(self.both_arm_action_lower).tolist(),
+                "upper": np.asarray(self.both_arm_action_upper).tolist(),
+                "reference": "raw_absolute_policy_target",
+                "source": BIMANUAL_YAM_ACTION_ENVELOPE_SOURCE,
             }
         return result
 
@@ -710,20 +808,24 @@ class BimanualActiveArmHoldMask:
                             "no target was sent."
                         )
 
-                delta = action - measured
-                reject_delta = np.asarray(self.both_arm_reject_delta, dtype=np.float32)
-                rejected = np.flatnonzero(np.abs(delta) > reject_delta)
+                action_lower = np.asarray(self.both_arm_action_lower, dtype=np.float32)
+                action_upper = np.asarray(self.both_arm_action_upper, dtype=np.float32)
+                rejected = np.flatnonzero(
+                    (action < action_lower) | (action > action_upper)
+                )
                 if rejected.size:
                     details = ", ".join(
-                        f"{int(index)}: |{float(delta[index]):.3f}|>"
-                        f"{float(reject_delta[index]):.3f}"
+                        f"{int(index)}: {float(action[index]):.3f} not in "
+                        f"[{float(action_lower[index]):.3f}, "
+                        f"{float(action_upper[index]):.3f}]"
                         for index in rejected[:4]
                     )
                     suffix = "" if rejected.size <= 4 else f" (+{rejected.size - 4} more)"
                     raise RuntimeError(
-                        "Bimanual action guard rejected a discontinuous "
+                        "Bimanual action guard rejected an out-of-envelope "
                         f"absolute target ({details}{suffix}); no target was sent."
                     )
+                delta = action - measured
                 max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
                 command = measured + np.clip(delta, -max_delta, max_delta)
                 return command.astype(np.float32, copy=False)
@@ -738,7 +840,6 @@ def resolve_bimanual_execution_mask(
     execution_mode: Optional[str],
     both_arm_active_cli_confirmed: bool = False,
     both_arm_max_delta: Any = None,
-    both_arm_reject_delta: Any = None,
 ) -> Optional[BimanualActiveArmHoldMask]:
     """Build the explicit safe execution adapter before opening motors.
 
@@ -780,7 +881,6 @@ def resolve_bimanual_execution_mask(
         active_arm_side=side,
         execution_mode=mode,
         both_arm_max_delta=both_arm_max_delta,
-        both_arm_reject_delta=both_arm_reject_delta,
     )
 
 
@@ -1197,6 +1297,28 @@ def run_session(
                 saved_rollouts.append(saver.rollout_dir)
             except Exception as exc:  # noqa: BLE001 — best-effort cleanup
                 logger.exception("Failed to flush incomplete rollout: %s", exc)
+    except Exception as exc:
+        # Preserve the telemetry gathered before a runtime failure (for
+        # example, an action-guard rejection).  ``run_one_rollout`` buffers
+        # steps in RAM, so without this path an exception loses the evidence
+        # needed to diagnose why the physical rollout stopped.  Cleanup is
+        # deliberately best-effort: the original failure remains the one the
+        # caller sees even if writing the incomplete artifacts also fails.
+        if saver is not None:
+            try:
+                saver.flush()
+            except Exception as flush_exc:  # noqa: BLE001 — preserve original error
+                logger.exception("Failed to flush failed rollout: %s", flush_exc)
+            try:
+                saver.write_err(
+                    reason=f"{type(exc).__name__}: {exc}",
+                    step=outcome.last_step if outcome else saver.num_steps,
+                )
+                print(f"  -> failed rollout saved: {saver.rollout_dir}")
+                saved_rollouts.append(saver.rollout_dir)
+            except Exception as marker_exc:  # noqa: BLE001 — preserve original error
+                logger.exception("Failed to mark failed rollout: %s", marker_exc)
+        raise
     finally:
         live_view.close()
         _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
@@ -1300,7 +1422,6 @@ def main() -> None:
         execution_mode=execution_mode,
         both_arm_active_cli_confirmed=has_explicit_both_arm_cli_opt_in(args),
         both_arm_max_delta=bimanual_cfg.get("both_arm_max_delta"),
-        both_arm_reject_delta=bimanual_cfg.get("both_arm_reject_delta"),
     )
     assert raw_right_cfg is not None  # established by the resolver above
     validate_bimanual_model_arm_order(raw_left_cfg, raw_right_cfg)

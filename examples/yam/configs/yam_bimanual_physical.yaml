@@ -56,11 +56,11 @@ eval:
     # execution must be chosen explicitly on the command line.
     active_arm_side: both
     execution_mode: shadow
-    # At 30 Hz: clamp a nominal target advance to 0.03 rad / aperture per
-    # tick. Arm-joint discontinuities >0.5 rad fail closed; a gripper may
-    # legitimately change its full normalized aperture and is rate-limited.
+    # At 30 Hz: clamp each absolute target advance to 0.03 rad / aperture per
+    # tick. The launcher separately rejects raw targets outside the released
+    # checkpoint's documented absolute-pose action envelope; it must not
+    # reject a valid target merely because it is far from current feedback.
     both_arm_max_delta: 0.03
-    both_arm_reject_delta: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0]
   live_view_enabled: false
   reproducibility:
     seed: 20260727

@@ -226,29 +226,43 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         model_action = np.full(14, 123.0, dtype=np.float32)
         np.testing.assert_array_equal(mask.command_target(model_action, measured), measured)
 
-    def test_bimanual_both_arm_guard_rate_limits_and_rejects_large_jumps(self):
-        reject_limit = np.array(
-            [0.5] * 6 + [1.0] + [0.5] * 6 + [1.0], dtype=np.float32
-        )
+    def test_bimanual_both_arm_guard_envelopes_absolute_targets_and_rate_limits(self):
         mask = launcher.BimanualActiveArmHoldMask(
             active_arm_side="both",
             execution_mode="active_arm_hold",
             both_arm_max_delta=0.03,
-            both_arm_reject_delta=reject_limit,
         )
         measured = np.zeros(14, dtype=np.float32)
-        action = np.full(14, 0.2, dtype=np.float32)
-        action[6] = 1.0
-        action[13] = 1.0
+        # A uniform 0.2 is not valid for every absolute-pose joint field
+        # (e.g. left joint 3's q99 is lower). Clip it into the documented
+        # target envelope while keeping every target more than one 0.03 tick
+        # from this zero measurement.
+        action = np.clip(
+            np.full(14, 0.2, dtype=np.float32),
+            np.asarray(launcher.BIMANUAL_YAM_ACTION_LOWER, dtype=np.float32),
+            np.asarray(launcher.BIMANUAL_YAM_ACTION_UPPER, dtype=np.float32),
+        )
         applied = mask.command_target(action, measured)
         np.testing.assert_allclose(applied, np.full(14, 0.03, dtype=np.float32))
         self.assertEqual(
-            mask.manifest_metadata()["both_arm_delta_guard"]["reference"],
+            mask.manifest_metadata()["both_arm_rate_limit"]["reference"],
             "fresh_encoder_feedback_each_tick",
         )
+        self.assertEqual(
+            mask.manifest_metadata()["both_arm_target_envelope"]["reference"],
+            "raw_absolute_policy_target",
+        )
 
-        action[0] = 0.51
-        with self.assertRaisesRegex(RuntimeError, "discontinuous absolute target"):
+        # A 0.523-rad target distance is ordinary for this checkpoint's
+        # absolute-pose output. The command must still advance by only 0.03.
+        action[2] = 0.523
+        applied = mask.command_target(action, measured)
+        self.assertAlmostEqual(float(applied[2]), 0.03)
+
+        # An action outside the checkpoint's documented absolute target
+        # envelope is rejected before either arm receives a command.
+        action[2] = 3.0
+        with self.assertRaisesRegex(RuntimeError, "out-of-envelope absolute target"):
             mask.command_target(action, measured)
 
     def test_bimanual_both_arm_shadow_never_needs_delta_guard(self):
@@ -287,7 +301,6 @@ class ClosedLoopRolloutTests(unittest.TestCase):
             execution_mode="active_arm_hold",
             both_arm_active_cli_confirmed=True,
             both_arm_max_delta=0.03,
-            both_arm_reject_delta=[0.5] * 6 + [1.0] + [0.5] * 6 + [1.0],
         )
         self.assertEqual(dual_mask.active_arm_side, "both")
         launcher.validate_bimanual_model_arm_order(
@@ -306,6 +319,60 @@ class ClosedLoopRolloutTests(unittest.TestCase):
 
 
 class RolloutRecordingTests(unittest.TestCase):
+    def test_session_exception_flushes_partial_actions_and_error_marker(self):
+        """A runtime failure after a command keeps the partial rollout inspectable."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            left_cfg = {
+                "storage": {
+                    "base_dir": str(root),
+                    "task_directory": "failed_session",
+                    "language_instruction": "test partial failure",
+                },
+                "max_steps": 10,
+                "eval": {"live_view_enabled": False},
+            }
+
+            def fail_after_one_saved_step(*, saver, **_kwargs):
+                saver.add_step(
+                    obs_pre={"joint_positions": np.array([0.0], dtype=np.float32)},
+                    obs_post={"joint_positions": np.array([0.1], dtype=np.float32)},
+                    action=np.array([0.25], dtype=np.float32),
+                )
+                raise RuntimeError("simulated post-step failure")
+
+            with (
+                patch.object(launcher, "move_to_rollout_start"),
+                patch.object(launcher, "prompt_instruction", return_value="test partial failure"),
+                patch.object(launcher, "build_rollout_manifest", return_value={"policy": {}}),
+                patch.object(launcher, "run_one_rollout", side_effect=fail_after_one_saved_step),
+                patch.object(
+                    launcher,
+                    "LiveCameraView",
+                    return_value=SimpleNamespace(close=lambda: None),
+                ),
+                patch.object(launcher, "_convert_if_any"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated post-step failure"):
+                    launcher.run_session(
+                        env=object(),
+                        policy=object(),
+                        left_cfg=left_cfg,
+                        right_cfg=None,
+                        bimanual=False,
+                        num_rollouts=1,
+                    )
+
+            rollout_dirs = list((root / "data" / "failed_session" / "eval").iterdir())
+            self.assertEqual(len(rollout_dirs), 1)
+            rollout_dir = rollout_dirs[0]
+            self.assertTrue((rollout_dir / "episode.h5").is_file())
+            err_text = (rollout_dir / "err.md").read_text(encoding="utf-8")
+            self.assertIn("RuntimeError: simulated post-step failure", err_text)
+            self.assertIn("Steps actually saved: 1", err_text)
+            with h5py.File(rollout_dir / "episode.h5", "r") as h5:
+                np.testing.assert_allclose(h5["action"][:], [[0.25]])
+
     def test_saved_actions_and_offline_rerun_recording(self):
         """Rerun conversion is post-hoc and has the exact applied commands."""
         with tempfile.TemporaryDirectory() as temp_dir:
