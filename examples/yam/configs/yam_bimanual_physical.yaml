@@ -59,11 +59,11 @@ eval:
     # execution must be chosen explicitly on the command line.
     active_arm_side: both
     execution_mode: shadow
-    # Fast bimanual target bound. This is over 3x faster than the original
-    # 0.03 rad/tick cap, but prevents raw absolute policy targets from
-    # snapping both arms across the workspace in a single 30 Hz command tick.
-    # Fields 6 and 13 are normalized gripper apertures.
-    both_arm_max_delta: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.05, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.05]
+    # Smooth bimanual target bound. This is still faster than the original
+    # 0.03 rad/tick cap, but keeps chunk-to-chunk policy reversals from
+    # feeling snappy on the real arms. Fields 6 and 13 are normalized gripper
+    # apertures.
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
   live_view_enabled: false
   # Return both arms to the encoder-measured pose at launcher startup only
   # after a normal, completed session. Faults and Ctrl-C never autonomously
