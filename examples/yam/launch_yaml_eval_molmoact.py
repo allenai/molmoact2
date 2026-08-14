@@ -165,7 +165,7 @@ class SessionResult:
     # rollout loop. A real fault (CAN error, policy exception) instead
     # propagates out of run_session and never reaches this field, so it stays
     # at the safe default below.
-    interrupted: bool = False
+    interrupted_by_user: bool = False
 
 
 def capture_rest_pose_at_startup(
@@ -688,6 +688,50 @@ def _close_failed_build_resources(
         _close_cameras_after_failed_startup(camera_dict)
 
 
+_CAN_RESET_BITRATE = 1_000_000
+
+
+def _reset_can_channel(channel: str) -> None:
+    """Cycle one socketcan interface down/up before opening its motor chain.
+
+    Both YAM arms live on a shared 6-motor daisy-chained CAN bus. Between
+    sessions (or after any control-thread crash) that bus is repeatedly
+    observed to latch ``ERROR-PASSIVE`` -- ``ip -details link show <channel>``
+    silently accumulates thousands of bus-errors -- which then fails motor
+    enable at startup with "fail to communicate with the motor N" before any
+    robot object exists (2026-08-14: hit three separate times in one
+    session). ``scripts/reset_all_can.sh`` in i2rt already fixes this by
+    hand; this mirrors exactly that recovery (down, then up at the fixed 1
+    Mbit bitrate every channel here uses) but automatically, once per
+    channel, before every launch -- so a stale bus from the previous run's
+    crash never has to be diagnosed and reset by hand again.
+
+    Best-effort: a channel name that is not a CAN interface, or a sandbox
+    without permission to touch links, logs a warning and lets the normal
+    motor-enable failure surface instead of masking it as something else.
+    """
+    if not channel or not str(channel).strip():
+        return
+    channel = str(channel).strip()
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    try:
+        subprocess.run(
+            [*prefix, "ip", "link", "set", channel, "down"],
+            check=True, capture_output=True, timeout=5,
+        )
+        subprocess.run(
+            [
+                *prefix, "ip", "link", "set", channel, "up",
+                "type", "can", "bitrate", str(_CAN_RESET_BITRATE),
+            ],
+            check=True, capture_output=True, timeout=5,
+        )
+        print(f"[can] reset {channel} (bitrate={_CAN_RESET_BITRATE})")
+    except Exception as exc:  # noqa: BLE001 -- best-effort, let motor-enable fail loudly
+        detail = exc.stderr.decode(errors="replace").strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+        logger.warning("CAN reset for channel %r failed (%s); continuing without it", channel, detail)
+
+
 def _build_env(
     args: Args,
 ) -> Tuple[RobotEnv, Dict[str, Any], Optional[Dict[str, Any]], bool]:
@@ -774,6 +818,7 @@ def _build_env(
             left_robot_cfg["config"] = OmegaConf.to_container(
                 OmegaConf.load(left_robot_cfg["config"]), resolve=True
             )
+        _reset_can_channel(left_robot_cfg.get("channel"))
         print(f"Opening primary YAM robot on CAN channel: {left_robot_cfg.get('channel', '<unspecified>')}")
         left_robot = instantiate_from_dict(left_robot_cfg)
 
@@ -783,6 +828,7 @@ def _build_env(
                 right_robot_cfg["config"] = OmegaConf.to_container(
                     OmegaConf.load(right_robot_cfg["config"]), resolve=True
                 )
+            _reset_can_channel(right_robot_cfg.get("channel"))
             print(f"Opening secondary YAM robot on CAN channel: {right_robot_cfg.get('channel', '<unspecified>')}")
             right_robot = instantiate_from_dict(right_robot_cfg)
             robot = BimanualRobot(left_robot, right_robot)
@@ -906,32 +952,39 @@ class BimanualActiveArmHoldMask:
                 "execution_mode must be 'active_arm_hold' or 'shadow', got "
                 f"{self.execution_mode!r}"
             )
-        if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
-            max_delta = None
+        if self.execution_mode == "active_arm_hold":
+            # Single-arm active_arm_hold also rate-limits through
+            # ``both_arm_max_delta`` now (2026-08-14: an unclamped single-arm
+            # replan jumped a joint 1.14 rad in one tick and stalled a
+            # motor's CAN response), so this coercion is no longer
+            # both-mode-only. It stays opt-in: a config with no
+            # ``both_arm_max_delta`` keeps the pre-fix direct-assignment
+            # behavior for single-arm sides.
             if self.both_arm_max_delta is not None:
                 max_delta = _coerce_bimanual_delta_limit(
                     self.both_arm_max_delta,
                     name="both_arm_max_delta",
                     state_dim=self.state_dim,
                 )
-            action_lower = _coerce_bimanual_action_bound(
-                self.both_arm_action_lower,
-                name="both_arm_action_lower",
-                state_dim=self.state_dim,
-            )
-            action_upper = _coerce_bimanual_action_bound(
-                self.both_arm_action_upper,
-                name="both_arm_action_upper",
-                state_dim=self.state_dim,
-            )
-            if np.any(action_lower >= action_upper):
-                raise ValueError(
-                    "both_arm_action_lower must be strictly below "
-                    "both_arm_action_upper for every field"
+                object.__setattr__(self, "both_arm_max_delta", max_delta)
+            if self.active_arm_side == "both":
+                action_lower = _coerce_bimanual_action_bound(
+                    self.both_arm_action_lower,
+                    name="both_arm_action_lower",
+                    state_dim=self.state_dim,
                 )
-            object.__setattr__(self, "both_arm_max_delta", max_delta)
-            object.__setattr__(self, "both_arm_action_lower", action_lower)
-            object.__setattr__(self, "both_arm_action_upper", action_upper)
+                action_upper = _coerce_bimanual_action_bound(
+                    self.both_arm_action_upper,
+                    name="both_arm_action_upper",
+                    state_dim=self.state_dim,
+                )
+                if np.any(action_lower >= action_upper):
+                    raise ValueError(
+                        "both_arm_action_lower must be strictly below "
+                        "both_arm_action_upper for every field"
+                    )
+                object.__setattr__(self, "both_arm_action_lower", action_lower)
+                object.__setattr__(self, "both_arm_action_upper", action_upper)
 
     @property
     def active_slice(self) -> slice:
@@ -1023,54 +1076,81 @@ class BimanualActiveArmHoldMask:
             raise ValueError(f"{name} contains non-finite values")
         return result
 
-    def command_target(self, policy_action: Any, measured_state: Any) -> np.ndarray:
+    def command_target(
+        self,
+        policy_action: Any,
+        measured_state: Any,
+        *,
+        first_tick_of_chunk: bool = True,
+    ) -> np.ndarray:
         """Return the 14-D target safe to send on this control tick.
 
         ``measured_state`` must be sampled immediately before this target is
         sent.  It is intentionally not a cached rollout-start state.
+
+        ``first_tick_of_chunk`` gates the per-tick rate limit (when
+        ``both_arm_max_delta`` is configured): only the first tick of a
+        freshly (re)planned chunk is clipped against live feedback, since a
+        chunk-boundary replan is exactly where an absolute-pose policy can
+        land an arbitrary discontinuity. Measured 2026-08-14: with this
+        clamp scoped to "both"-mode only, an unclamped single-arm replan
+        jumped a left-arm joint by -1.14 rad in one control tick and stalled
+        that motor's CAN response a few ticks later. Later ticks in the same
+        chunk are the checkpoint's own already-coherent within-chunk
+        trajectory and are sent unmodified, matching "both" mode's existing
+        contract.
         """
         measured = self.validate_state(measured_state, name="measured_state")
         action = self.validate_state(policy_action, name="policy_action")
         command = measured.copy()
-        if self.execution_mode == "active_arm_hold":
-            if self.active_arm_side == "both":
-                # Grippers are normalized apertures, not motor coordinates.
-                # Validate both raw model values before any half reaches the
-                # serial left-then-right dispatcher.
-                for arm_label, gripper_index in self.active_grippers:
-                    aperture = float(action[gripper_index])
-                    if not -0.05 <= aperture <= 1.05:
-                        raise RuntimeError(
-                            "Bimanual action guard rejected an invalid "
-                            f"{arm_label} gripper aperture {aperture:.4f}; "
-                            "no target was sent."
-                        )
+        if self.execution_mode != "active_arm_hold":
+            return command
 
-                action_lower = np.asarray(self.both_arm_action_lower, dtype=np.float32)
-                action_upper = np.asarray(self.both_arm_action_upper, dtype=np.float32)
-                rejected = np.flatnonzero(
-                    (action < action_lower) | (action > action_upper)
-                )
-                if rejected.size:
-                    details = ", ".join(
-                        f"{int(index)}: {float(action[index]):.3f} not in "
-                        f"[{float(action_lower[index]):.3f}, "
-                        f"{float(action_upper[index]):.3f}]"
-                        for index in rejected[:4]
-                    )
-                    suffix = "" if rejected.size <= 4 else f" (+{rejected.size - 4} more)"
+        if self.active_arm_side == "both":
+            # Grippers are normalized apertures, not motor coordinates.
+            # Validate both raw model values before any half reaches the
+            # serial left-then-right dispatcher.
+            for arm_label, gripper_index in self.active_grippers:
+                aperture = float(action[gripper_index])
+                if not -0.05 <= aperture <= 1.05:
                     raise RuntimeError(
-                        "Bimanual action guard rejected an out-of-envelope "
-                        f"absolute target ({details}{suffix}); no target was sent."
+                        "Bimanual action guard rejected an invalid "
+                        f"{arm_label} gripper aperture {aperture:.4f}; "
+                        "no target was sent."
                     )
-                if self.both_arm_max_delta is None:
-                    return action.astype(np.float32, copy=True)
-                delta = action - measured
-                max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
-                command = measured + np.clip(delta, -max_delta, max_delta)
-                return command.astype(np.float32, copy=False)
-            command[self.active_slice] = action[self.active_slice]
-        return command
+
+            action_lower = np.asarray(self.both_arm_action_lower, dtype=np.float32)
+            action_upper = np.asarray(self.both_arm_action_upper, dtype=np.float32)
+            rejected = np.flatnonzero(
+                (action < action_lower) | (action > action_upper)
+            )
+            if rejected.size:
+                details = ", ".join(
+                    f"{int(index)}: {float(action[index]):.3f} not in "
+                    f"[{float(action_lower[index]):.3f}, "
+                    f"{float(action_upper[index]):.3f}]"
+                    for index in rejected[:4]
+                )
+                suffix = "" if rejected.size <= 4 else f" (+{rejected.size - 4} more)"
+                raise RuntimeError(
+                    "Bimanual action guard rejected an out-of-envelope "
+                    f"absolute target ({details}{suffix}); no target was sent."
+                )
+            if self.both_arm_max_delta is None or not first_tick_of_chunk:
+                return action.astype(np.float32, copy=True)
+            delta = action - measured
+            max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
+            command = measured + np.clip(delta, -max_delta, max_delta)
+            return command.astype(np.float32, copy=False)
+
+        active = self.active_slice
+        if self.both_arm_max_delta is None or not first_tick_of_chunk:
+            command[active] = action[active]
+            return command.astype(np.float32, copy=False)
+        max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)[active]
+        delta = action[active] - measured[active]
+        command[active] = measured[active] + np.clip(delta, -max_delta, max_delta)
+        return command.astype(np.float32, copy=False)
 
 
 def resolve_bimanual_execution_mask(
@@ -1561,7 +1641,11 @@ def run_one_rollout(
         policy_action = action_chunk[action_index_in_chunk]
         chunk_index += 1
         action = (
-            execution_mask.command_target(policy_action, obs_pre["joint_positions"])
+            execution_mask.command_target(
+                policy_action,
+                obs_pre["joint_positions"],
+                first_tick_of_chunk=(action_index_in_chunk == chunk_start_row),
+            )
             if execution_mask is not None
             else policy_action
         )
@@ -1700,7 +1784,7 @@ def run_session(
     global _rest_return_eligible
     saved_rollouts: List[Path] = []
     clean_exit = True
-    interrupted = False
+    interrupted_by_user = False
     saver: Optional[EvalRolloutSaver] = None
     outcome: Optional[RolloutOutcome] = None
 
@@ -1793,7 +1877,7 @@ def run_session(
             outcome = None
     except KeyboardInterrupt:
         clean_exit = False
-        interrupted = True
+        interrupted_by_user = True
         print("\n[interrupt] Ctrl-C received — saving incomplete rollout, then converting...")
         if saver is not None:
             try:
@@ -1833,7 +1917,11 @@ def run_session(
         live_view.close()
         _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
 
-    return SessionResult(saved_rollouts=saved_rollouts, clean_exit=clean_exit, interrupted=interrupted)
+    return SessionResult(
+        saved_rollouts=saved_rollouts,
+        clean_exit=clean_exit,
+        interrupted_by_user=interrupted_by_user,
+    )
 
 
 def _convert_if_any(
@@ -2083,7 +2171,7 @@ def main() -> None:
         # refused on an implausible jump by return_to_captured_rest_pose
         # itself). A real fault never reaches this line — run_session
         # re-raises, so _rest_return_eligible stays at its fail-safe default.
-        _rest_return_eligible = session_result.clean_exit or session_result.interrupted
+        _rest_return_eligible = session_result.clean_exit or session_result.interrupted_by_user
         _session_clean_exit = session_result.clean_exit
     finally:
         # Close robot/CAN and V4L2 resources before any post-rollout

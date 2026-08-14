@@ -32,6 +32,7 @@ examples/yam/
 ├── eval_utils.py                 # per-rollout saver, cv2 viewer, labeling, conversion
 ├── rerun_rollout.py               # saved rollout -> offline Rerun .rrd playback
 ├── rerun_export_watchdog.py       # detached crash-resilient .rrd exporter
+├── view_rollout.sh                # open an .rrd on a network-accessible web viewer
 ├── lerobot_convert.py            # raw rollouts -> LeRobot v3.0 dataset
 ├── start_camera_server.sh        # convenience launcher for camera_server.py
 ├── requirements.txt
@@ -315,13 +316,19 @@ Open the recording after the rollout finishes:
   yam_eval_runs/data/red_lid_left_arm/eval/<timestamp>/rollout.rrd
 ```
 
-Or use Rerun's browser viewer and open the URL it prints (normally
-`http://127.0.0.1:9090`):
+Or use the helper to bind the browser viewer and recording server to every
+network interface. It prints a complete LAN URL that opens the saved recording
+directly (opening the bare port 9090 URL only shows Rerun's file picker):
 
 ```bash
-/home/npow/molmoact2-venv/bin/rerun --web-viewer --web-viewer-port 9090 \
+examples/yam/view_rollout.sh \
   yam_eval_runs/data/red_lid_left_arm/eval/<timestamp>/rollout.rrd
 ```
+
+The helper uses ports 9090 (viewer) and 9876 (recording) by default. Override
+them with `RERUN_WEB_PORT` and `RERUN_GRPC_PORT`, or override the executable
+with `RERUN_BIN`. Set `RERUN_PUBLIC_IP` when the browser reaches the machine
+through a different hostname or address, such as Tailscale.
 
 The recording starts with a three-camera timeline and includes:
 
