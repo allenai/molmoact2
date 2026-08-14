@@ -36,15 +36,29 @@ from types import ModuleType, SimpleNamespace
 from servo_session_bridge import (
     ACTION_HORIZON,
     CAMERA_KEYS,
+    OBSERVATION_ENCODINGS,
     SDK_CREDENTIAL_SCHEMA,
     SERVO_PYTHON_ENV,
     STATE_DIM,
     ServoBridgeError,
+    ServoDirectHost,
     ServoSessionHost,
     encode_frame,
+    frame_parts,
+    missing_cameras,
+    raw_frame_array,
+    raw_frame_spec,
     read_frame,
     write_frame,
 )
+
+try:  # numpy is present in both runtimes; the bridge only needs it for pixels.
+    import numpy as np
+
+    _HAVE_NUMPY = True
+except Exception:  # pragma: no cover - numpy is a hard dep of the robot runtime
+    np = None  # type: ignore[assignment]
+    _HAVE_NUMPY = False
 
 try:  # ``molmoact_client`` pulls torch/transformers; the bridge itself does not.
     from molmoact_client import MolmoActServo, ServoSessionTransport
@@ -1293,3 +1307,331 @@ class MolmoActServoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 6. The codec wire: raw pixels across the bridge, and a cold-failing open
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_servo_direct(test, *, attach_hook=None, metadata=None,
+                               metadata_error=None, session_error=None):
+    """Inject a fake ``servo.direct`` and record what ``attach`` was given."""
+
+    state = SimpleNamespace(attach_calls=[], policies=[], closed=0, sessions=0)
+
+    class _FakeGrant:
+        endpoint_url = "https://fake.endpoint:8443"
+        session_route = "quic://fake.endpoint:9443"
+        control_profile = {"max_jump": None, "max_relative_target": None,
+                           "fps": 30.0, "exec_steps": 30}
+        camera_inputs = {}
+        identity = {
+            "deployment_id": "dep_fake",
+            # Matches _fake_prediction's binding: the direct host now fences
+            # every response against the grant's generation, so a fixture that
+            # disagreed would be testing the fence, not the wire.
+            "deploy_generation": "gen_test_1",
+            "checkpoint_digest": "sha256:fake",
+            "manifest_hash": "sha256:manifest-a",
+        }
+
+    class _FakeTransport:
+        lease = SimpleNamespace(session_id="actsession_fake_1")
+
+    class _FakePolicy:
+        def __init__(self, **kwargs):
+            self.grant = _FakeGrant()
+            self.camera_inputs = {}
+            self.kwargs = kwargs
+            self.acts = []
+
+        def metadata(self):
+            if metadata_error is not None:
+                raise metadata_error
+            return dict(metadata or {"manifest_hash": "sha256:manifest-a"})
+
+        def open_action_session_transport(self, *, instruction=None):
+            if session_error is not None:
+                raise session_error
+            state.sessions += 1
+            return _FakeTransport()
+
+        def act(self, observation, instruction=None):
+            self.acts.append((observation, instruction))
+            return _fake_prediction()
+
+        def close(self):
+            state.closed += 1
+
+    def _attach(**kwargs):
+        state.attach_calls.append(dict(kwargs))
+        if attach_hook is not None:
+            attach_hook(kwargs)
+        policy = _FakePolicy(**kwargs)
+        state.policies.append(policy)
+        return policy
+
+    package = ModuleType("servo")
+    package.__spec__ = importlib.machinery.ModuleSpec("servo", loader=None)
+    package.__path__ = []  # type: ignore[attr-defined]
+    direct = ModuleType("servo.direct")
+    direct.__spec__ = importlib.machinery.ModuleSpec("servo.direct", loader=None)
+    direct.attach = _attach
+    package.direct = direct
+
+    previous = {name: sys.modules.get(name) for name in ("servo", "servo.direct")}
+    sys.modules["servo"] = package
+    sys.modules["servo.direct"] = direct
+
+    def _restore():
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:  # pragma: no cover
+                sys.modules[name] = module
+
+    test.addCleanup(_restore)
+    return state
+
+
+def _write_grant(directory: str) -> str:
+    path = Path(directory) / "grant.txt"
+    path.write_text("fake-grant-blob")
+    path.chmod(0o600)
+    return str(path)
+
+
+@unittest.skipUnless(_HAVE_NUMPY, "numpy is required for the raw-pixel wire")
+class RawFrameFramingTests(unittest.TestCase):
+    """The pipe must carry pixels intact -- a wrong shape is undetectable later."""
+
+    def test_a_raw_frame_survives_the_pipe_byte_for_byte(self):
+        image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+        buffer = memoryview(np.ascontiguousarray(image)).cast("B")
+        header = {"op": "act", "frames": {"top": raw_frame_spec(0, 4, 5)}}
+        stream = io.BytesIO(b"".join(bytes(p) for p in frame_parts(header, [buffer])))
+        decoded_header, buffers = read_frame(stream)
+        restored = raw_frame_array(buffers[0], decoded_header["frames"]["top"])
+        self.assertEqual(restored.shape, (4, 5, 3))
+        self.assertEqual(restored.dtype, np.uint8)
+        self.assertTrue(np.array_equal(restored, image))
+
+    def test_a_memoryview_is_framed_by_its_byte_count_not_its_row_count(self):
+        # ``len(memoryview(hxwx3))`` is the ROW count. Framing that would
+        # declare a 4-byte buffer for a 60-byte frame and truncate silently.
+        image = np.zeros((4, 5, 3), dtype=np.uint8)
+        buffer = memoryview(image).cast("B")
+        self.assertEqual(len(buffer), image.nbytes)
+        parts = frame_parts({"op": "act"}, [buffer])
+        self.assertEqual(sum(len(bytes(p)) for p in parts[3:]), image.nbytes)
+
+    def test_a_truncated_raw_frame_is_refused_not_reshaped(self):
+        with self.assertRaisesRegex(ServoBridgeError, "expected 60"):
+            raw_frame_array(b"\x00" * 59, raw_frame_spec(0, 4, 5))
+
+    def test_a_foreign_dtype_is_refused(self):
+        spec = {**raw_frame_spec(0, 4, 5), "dtype": "float32"}
+        with self.assertRaisesRegex(ServoBridgeError, "must be uint8"):
+            raw_frame_array(b"\x00" * 60, spec)
+
+    def test_missing_cameras_reports_arrays_without_raising(self):
+        full = {key: np.zeros((2, 2, 3), dtype=np.uint8) for key in CAMERA_KEYS}
+        self.assertEqual(missing_cameras(full), [])
+        empty = {**full, "left": np.zeros((0, 2, 3), dtype=np.uint8)}
+        self.assertEqual(missing_cameras(empty), ["left"])
+        self.assertEqual(missing_cameras({}), list(CAMERA_KEYS))
+
+
+class ServoDirectHostOpenTests(unittest.TestCase):
+    """``open`` must prove the endpoint with the arms COLD.
+
+    ``DirectPolicy`` is lazy -- it touches the network on its first act -- so
+    without a forced round trip a stale grant opens clean and fails once the
+    motors are live. That is the failure this class exists to prevent.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = _write_grant(self._dir.name)
+
+    def test_open_forces_the_endpoint_and_session_round_trips(self):
+        state = _install_fake_servo_direct(self)
+        host = ServoDirectHost(grant=self.grant, instruction="pick up the lid")
+        identity = host.open()
+        self.assertEqual(state.sessions, 1)
+        self.assertEqual(identity["session_id"], "actsession_fake_1")
+        self.assertEqual(identity["generation_id"], "gen_test_1")
+        self.assertEqual(identity["deployment_id"], "dep_fake")
+        self.assertEqual(identity["observation_encoding"], "jpeg")
+
+    def test_a_stale_grant_fails_at_open_not_at_act(self):
+        state = _install_fake_servo_direct(
+            self, metadata_error=RuntimeError("401 endpoint token kid is not configured")
+        )
+        host = ServoDirectHost(grant=self.grant)
+        with self.assertRaisesRegex(ServoBridgeError, "refused the grant at open"):
+            host.open()
+        # The failed policy is released rather than left holding a connection.
+        self.assertEqual(state.closed, 1)
+
+    def test_a_grant_for_a_previous_serve_fails_at_open(self):
+        _install_fake_servo_direct(self, metadata={"manifest_hash": "sha256:manifest-b"})
+        host = ServoDirectHost(grant=self.grant)
+        with self.assertRaisesRegex(ServoBridgeError, "previous serve"):
+            host.open()
+
+    def test_a_refused_session_fails_at_open(self):
+        _install_fake_servo_direct(self, session_error=RuntimeError("lease refused"))
+        host = ServoDirectHost(grant=self.grant)
+        with self.assertRaisesRegex(ServoBridgeError, "refused to open"):
+            host.open()
+
+    def test_the_negotiated_encoding_reaches_attach(self):
+        state = _install_fake_servo_direct(self)
+        host = ServoDirectHost(
+            grant=self.grant, observation_encoding="h264", h264_crf=27
+        )
+        identity = host.open()
+        self.assertEqual(state.attach_calls[0]["observation_encoding"], "h264")
+        self.assertEqual(state.attach_calls[0]["h264_crf"], 27)
+        self.assertEqual(identity["observation_encoding"], "h264")
+        self.assertEqual(identity["h264_crf"], 27)
+
+    def test_an_sdk_without_the_codec_wire_is_named_not_silently_downgraded(self):
+        def _reject(kwargs):
+            if "observation_encoding" in kwargs:
+                raise TypeError("attach() got an unexpected keyword argument")
+
+        _install_fake_servo_direct(self, attach_hook=_reject)
+        host = ServoDirectHost(grant=self.grant, observation_encoding="h264")
+        with self.assertRaisesRegex(ServoBridgeError, "predates the codec wire"):
+            host.open()
+
+    def test_an_unknown_encoding_is_refused_up_front(self):
+        with self.assertRaisesRegex(ServoBridgeError, "observation_encoding must be"):
+            ServoDirectHost(grant=self.grant, observation_encoding="av1")
+
+    def test_a_crf_without_the_codec_wire_is_refused(self):
+        with self.assertRaisesRegex(ServoBridgeError, "h264_crf only applies"):
+            ServoDirectHost(grant=self.grant, h264_crf=27)
+
+    def test_a_generation_switch_under_a_direct_session_is_refused(self):
+        # Populating generation_id at open is what arms the inherited fence
+        # for self-hosted endpoints; before that it was silently inert here.
+        state = _install_fake_servo_direct(self)
+        state_grant = sys.modules["servo.direct"]
+        host = ServoDirectHost(grant=self.grant)
+        host.open()
+        host.identity["generation_id"] = "gen_other"
+        with self.assertRaisesRegex(ServoBridgeError, "different generation"):
+            host.act({key: b"\xff\xd8jpeg" for key in CAMERA_KEYS}, [0.0] * STATE_DIM)
+        del state, state_grant
+
+    @unittest.skipUnless(_HAVE_NUMPY, "numpy is required for the raw-pixel wire")
+    def test_raw_pixels_reach_the_sdk_unencoded(self):
+        state = _install_fake_servo_direct(self)
+        host = ServoDirectHost(grant=self.grant, observation_encoding="h264")
+        host.open()
+        images = {
+            key: np.full((2, 3, 3), index + 1, dtype=np.uint8)
+            for index, key in enumerate(CAMERA_KEYS)
+        }
+        host.act(images, [0.0] * STATE_DIM)
+        observation, _ = state.policies[0].acts[0]
+        for key in CAMERA_KEYS:
+            frame = observation["images"][key]
+            self.assertFalse(isinstance(frame, (bytes, bytearray)))
+            self.assertTrue(np.array_equal(frame, images[key]))
+
+
+@unittest.skipUnless(_HAVE_CLIENT, _CLIENT_SKIP)
+@unittest.skipUnless(_HAVE_NUMPY, "numpy is required for the raw-pixel wire")
+class MolmoActServoWireTests(unittest.TestCase):
+    """Which payload the policy builds is decided by the negotiated wire."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = _write_grant(self._dir.name)
+
+    def _policy(self, **kwargs):
+        return MolmoActServo(
+            grant=self.grant,
+            servo_python=sys.executable,
+            instruction="pick up the red lid",
+            **kwargs,
+        )
+
+    def _observation(self):
+        return {
+            "left_camera_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front_camera_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+            "right_camera_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+            "joint_positions": np.zeros(STATE_DIM, dtype=np.float32),
+        }
+
+    def _sent_images(self, policy):
+        captured = {}
+
+        def _act(images, state, instruction=None):
+            captured["images"] = images
+            return _fake_prediction().__dict__ if hasattr(_fake_prediction(), "__dict__") else {}
+
+        return captured, _act
+
+    def test_the_jpeg_wire_still_mints_jpeg_bytes(self):
+        policy = self._policy()
+        prepared = policy.prepare_input(self._observation(), "pick up the red lid")
+        captured = {}
+        with unittest.mock.patch.object(
+            policy._transport, "act",
+            side_effect=lambda images, state, instruction=None: (
+                captured.update(images=images) or _fake_prediction_dict()
+            ),
+        ):
+            policy.inference(prepared)
+        for key in CAMERA_KEYS:
+            self.assertIsInstance(captured["images"][key], bytes)
+            self.assertTrue(captured["images"][key].startswith(b"\xff\xd8"))
+
+    def test_the_codec_wire_sends_raw_contiguous_uint8_pixels(self):
+        policy = self._policy(observation_encoding="h264")
+        prepared = policy.prepare_input(self._observation(), "pick up the red lid")
+        captured = {}
+        with unittest.mock.patch.object(
+            policy._transport, "act",
+            side_effect=lambda images, state, instruction=None: (
+                captured.update(images=images) or _fake_prediction_dict()
+            ),
+        ):
+            policy.inference(prepared)
+        for key in CAMERA_KEYS:
+            frame = captured["images"][key]
+            self.assertIsInstance(frame, np.ndarray)
+            self.assertEqual(frame.dtype, np.uint8)
+            self.assertEqual(frame.shape, (8, 8, 3))
+            self.assertTrue(frame.flags["C_CONTIGUOUS"])
+
+    def test_the_codec_wire_needs_a_self_hosted_grant(self):
+        with self.assertRaisesRegex(ServoBridgeError, "self-hosted|grant="):
+            MolmoActServo(
+                deployment="dep_hosted",
+                credentials=_write_credentials(self._dir.name),
+                servo_python=sys.executable,
+                observation_encoding="h264",
+            )
+
+    def test_every_declared_encoding_is_constructible(self):
+        for encoding in OBSERVATION_ENCODINGS:
+            self._policy(observation_encoding=encoding)
+
+
+def _fake_prediction_dict():
+    """The bridge-shaped prediction mapping ``MolmoActServo.inference`` consumes."""
+    return {
+        "actions": [[0.0] * STATE_DIM for _ in range(ACTION_HORIZON)],
+        "action_space": "joint_position",
+        "telemetry": {"server_infer_ms": 12.0, "request_bytes": 4096},
+    }
