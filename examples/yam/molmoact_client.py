@@ -27,7 +27,7 @@ import threading
 import time
 from abc import ABC
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import hf_transfer  # noqa: F401
 import json_numpy
@@ -154,12 +154,23 @@ class MolmoActHTTP(PolicyBase):
         *,
         request_timeout_sec: float = 60.0,
         jpeg_wire: bool = True,
+        # MolmoAct2-BimanualYAM's own image processor (crop_mode "resize")
+        # squishes whatever arrives down to this size before the vision
+        # tower ever sees it (checkpoint's processor_config.json /
+        # vit_config.image_default_input_size). Unlike the Servo path, which
+        # deliberately ships source resolution because the managed runtime
+        # owns model-specific resize/padding, there is no such runtime here
+        # -- every pixel sent past 378x378 is pure wasted wire time. Pass
+        # ``None`` to send source resolution (e.g. to compare against a
+        # different checkpoint's input size).
+        image_size: Optional[Tuple[int, int]] = (378, 378),
     ):
         self.logger = get_molmoact_logger()
         if request_timeout_sec <= 0:
             raise ValueError("request_timeout_sec must be positive")
         self.jpeg_wire = bool(jpeg_wire)
         self.request_timeout_sec = float(request_timeout_sec)
+        self.image_size = tuple(image_size) if image_size is not None else None
         self.url = _normalize_server_url(server)
         self._http = requests.Session()
         self.multi_views = True
@@ -172,6 +183,22 @@ class MolmoActHTTP(PolicyBase):
 
     def get_action_horizon(self):
         return self.action_horizon
+
+    def _resize_for_wire(self, arr: np.ndarray) -> np.ndarray:
+        """Downsize before transfer to the checkpoint's own processor input size.
+
+        A no-op once ``arr`` is already at ``self.image_size`` (the common
+        case once the camera config is updated) or when resizing is disabled.
+        Bilinear to match the image processor's own resample=2 setting.
+        """
+        if self.image_size is None:
+            return arr
+        target_h, target_w = self.image_size
+        if arr.shape[:2] == (target_h, target_w):
+            return arr
+        return np.array(
+            Image.fromarray(arr).resize((target_w, target_h), resample=Image.BILINEAR)
+        )
 
     def reproducibility_metadata(self) -> Dict[str, Any]:
         return {
@@ -294,9 +321,9 @@ class MolmoActHTTP(PolicyBase):
             else:
                 self.logger.info("Using multi-view mode")
                 # Convert PIL image to a NumPy array
-                left_img_np = np.array(images[0])
-                front_img_np = np.array(images[1])
-                right_img_np = np.array(images[2])
+                left_img_np = self._resize_for_wire(np.array(images[0]))
+                front_img_np = self._resize_for_wire(np.array(images[1]))
+                right_img_np = self._resize_for_wire(np.array(images[2]))
 
                 self.logger.info(f"Left image shape: {left_img_np.shape}")
                 self.logger.info(f"Front image shape: {front_img_np.shape}")

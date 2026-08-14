@@ -151,12 +151,21 @@ _captured_rest_joints: Optional[np.ndarray] = None
 _return_to_captured_rest_on_exit: bool = False
 _return_to_rest_max_joint_step: float = 0.01
 _rest_return_eligible: bool = False
+# Whether the session actually completed all rollouts normally — distinct
+# from ``_rest_return_eligible``, which an operator-issued Ctrl-C also sets.
+# Only a true clean exit should report "success" to a remote policy session.
+_session_clean_exit: bool = False
 
 
 @dataclass(frozen=True)
 class SessionResult:
     saved_rollouts: List[Path]
     clean_exit: bool
+    # True only for an operator-issued Ctrl-C caught inside run_session's own
+    # rollout loop. A real fault (CAN error, policy exception) instead
+    # propagates out of run_session and never reaches this field, so it stays
+    # at the safe default below.
+    interrupted: bool = False
 
 
 def capture_rest_pose_at_startup(
@@ -176,12 +185,15 @@ def capture_rest_pose_at_startup(
     """
     global _captured_rest_joints, _return_to_captured_rest_on_exit
     global _return_to_rest_max_joint_step
-    global _rest_return_eligible
+    global _rest_return_eligible, _session_clean_exit
 
     _captured_rest_joints = None
     _return_to_captured_rest_on_exit = bool(enabled)
-    # A shutdown caused by Ctrl-C, a CAN/control fault, or policy error must
-    # hold and disable the robot rather than initiating a new autonomous path.
+    _session_clean_exit = False
+    # A shutdown caused by a CAN/control fault or policy error must hold and
+    # disable the robot rather than initiating a new autonomous path. An
+    # operator-issued Ctrl-C is also fail-safe by default until main() marks
+    # it eligible after run_session returns.
     # ``main`` flips this only after run_session() returns normally.
     _rest_return_eligible = False
     if not _return_to_captured_rest_on_exit:
@@ -327,14 +339,14 @@ def _shutdown_runtime() -> None:
     # never delay motor release.
     if _policy is not None:
         try:
-            # ``_rest_return_eligible`` is set from ``session_result.clean_exit``
+            # ``_session_clean_exit`` is set from ``session_result.clean_exit``
             # right before this runs (main's ``finally``) — it is the only
-            # place that knows whether the run actually completed. Any other
-            # exit path (an exception, Ctrl-C, or a fault before that
-            # assignment) leaves it at its False default, so a policy that
-            # records the outcome remotely (a Servo action session) reports
-            # failure rather than defaulting every abort to "success".
-            _policy.close(success=_rest_return_eligible)
+            # place that knows whether the run actually completed, and unlike
+            # ``_rest_return_eligible`` it is NOT also set by an operator
+            # Ctrl-C: an interrupted rollout is safe to physically return to
+            # rest but did not succeed, so a policy that records the outcome
+            # remotely (a Servo action session) must still see "failure".
+            _policy.close(success=_session_clean_exit)
         except Exception as exc:  # noqa: BLE001 — all teardown is best-effort
             logger.warning("Policy close failed: %s", exc)
 
@@ -1528,6 +1540,7 @@ def run_session(
     global _rest_return_eligible
     saved_rollouts: List[Path] = []
     clean_exit = True
+    interrupted = False
     saver: Optional[EvalRolloutSaver] = None
     outcome: Optional[RolloutOutcome] = None
 
@@ -1619,6 +1632,7 @@ def run_session(
             outcome = None
     except KeyboardInterrupt:
         clean_exit = False
+        interrupted = True
         print("\n[interrupt] Ctrl-C received — saving incomplete rollout, then converting...")
         if saver is not None:
             try:
@@ -1658,7 +1672,7 @@ def run_session(
         live_view.close()
         _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
 
-    return SessionResult(saved_rollouts=saved_rollouts, clean_exit=clean_exit)
+    return SessionResult(saved_rollouts=saved_rollouts, clean_exit=clean_exit, interrupted=interrupted)
 
 
 def _convert_if_any(
@@ -1702,7 +1716,7 @@ def _convert_if_any(
 
 
 def main() -> None:
-    global _rest_return_eligible, _policy
+    global _rest_return_eligible, _session_clean_exit, _policy
 
     # Fallback only. The explicit ``finally`` below is the normal shutdown
     # path because Python waits for the robot's non-daemon server thread before
@@ -1885,10 +1899,13 @@ def main() -> None:
             secondary_config_path=args.right_config_path,
             process_seed_metadata=process_seed_metadata,
         )
-        # A known-complete session is the only condition under which teardown
-        # may move the robot back to its captured pose. Faults and Ctrl-C take
-        # the fail-safe path above: hold, then disable torque.
-        _rest_return_eligible = session_result.clean_exit
+        # A completed session or an operator-issued Ctrl-C both make teardown
+        # eligible to move the robot back to its captured pose (bounded and
+        # refused on an implausible jump by return_to_captured_rest_pose
+        # itself). A real fault never reaches this line — run_session
+        # re-raises, so _rest_return_eligible stays at its fail-safe default.
+        _rest_return_eligible = session_result.clean_exit or session_result.interrupted
+        _session_clean_exit = session_result.clean_exit
     finally:
         # Close robot/CAN and V4L2 resources before any post-rollout
         # visualization work. A hung exporter must never retain the controller
