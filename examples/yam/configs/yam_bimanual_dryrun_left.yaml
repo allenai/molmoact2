@@ -43,7 +43,7 @@ agent:
 hz: 30
 # ~30 s of loop at 30 Hz: long enough for a stable per-act p50 across several
 # chunk boundaries, short enough to run twice before a demo.
-max_steps: 900
+max_steps: 240
 
 storage:
   base_dir: "./yam_eval_runs"
