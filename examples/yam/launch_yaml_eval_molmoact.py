@@ -1288,6 +1288,14 @@ def print_execution_bracket(
         f"max_jump={jump if jump is not None else 'NONE'}, "
         f"max_relative_target={relative if relative is not None else 'NONE'}"
     )
+    provenance = dict(identity.get("control_provenance") or {})
+    if provenance:
+        print(
+            "[execution] guard provenance: "
+            f"jump={provenance.get('jump') or 'unknown'}, "
+            f"actuation={provenance.get('actuation') or 'unknown'}, "
+            f"fps={provenance.get('fps') or 'unknown'}"
+        )
     if identity and (jump is None or relative is None):
         print(
             "[execution] WARNING: this grant carries no server-side actuation guard; "

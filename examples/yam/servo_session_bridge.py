@@ -577,12 +577,18 @@ class ServoDirectHost(ServoSessionHost):
             "checkpoint_digest": identity_fields.get("checkpoint_digest"),
             "manifest_hash": served or expected,
             "base_url": getattr(policy.grant, "endpoint_url", None),
-            "session_route": getattr(policy.grant, "session_route", None),
             "cameras": sorted(dict(getattr(policy, "camera_inputs", None) or {})),
             "camera_inputs": dict(getattr(policy, "camera_inputs", None) or {}),
             "observation_encoding": self.observation_encoding,
             "h264_crf": self.h264_crf,
             "control_profile": dict(getattr(policy.grant, "control_profile", None) or {}),
+            # Where each control number came from. A generic bracket and a
+            # measured one are indistinguishable from the profile alone, and
+            # inheriting another model family's numbers silently is exactly the
+            # failure this field exists to make visible.
+            "control_provenance": dict(
+                getattr(policy.grant, "control_provenance", None) or {}
+            ),
         })
         return dict(self.identity)
 
