@@ -1066,22 +1066,8 @@ class BimanualActiveArmHoldMask:
             if self.both_arm_max_delta is not None:
                 max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
                 delta = command - measured
-                lower = -max_delta.copy()
-                upper = max_delta.copy()
-                for _, gi in self.active_grippers:
-                    upper[gi] = GRIPPER_OPEN_MAX_DELTA
-                    lower[gi] = -GRIPPER_CLOSE_MAX_DELTA
-                command = measured + np.clip(delta, lower, upper)
+                command = measured + np.clip(delta, -max_delta, max_delta)
         return command
-
-
-# Gripper rate bounds are asymmetric: opening (aperture increasing) is a
-# release — safe at any speed, and a slow open reads as "stuck" mid-task —
-# while closing keeps a bound so contact with objects stays controlled.
-# Normalized aperture units per 30 Hz tick: open 1.0 = instant, close 0.1 =
-# full stroke in ~0.33 s.
-GRIPPER_OPEN_MAX_DELTA = 1.0
-GRIPPER_CLOSE_MAX_DELTA = 0.1
 
 
 def _apply_max_arm_delta_override(configured: Any, override: Optional[float]) -> Any:
