@@ -503,11 +503,6 @@ class Args:
     the arm backward; the elapsed-row splice is the fix (servo run_chunked's
     design)."""
 
-    max_arm_delta: Optional[float] = None
-    """Override the per-tick arm-joint rate limit (rad/tick; at 30 Hz 0.02 =
-    0.6 rad/s, 0.033 = 1.0 rad/s). Applies to the 12 arm joints of
-    both_arm_max_delta; gripper bounds keep their configured values."""
-
     replan_settle_s: float = 0.0
     """Dwell this long at each chunk boundary (after the first) before capturing the
     replan observation. A fast remote policy replans ~150 ms after the last command
@@ -1068,18 +1063,6 @@ class BimanualActiveArmHoldMask:
                 delta = command - measured
                 command = measured + np.clip(delta, -max_delta, max_delta)
         return command
-
-
-def _apply_max_arm_delta_override(configured: Any, override: Optional[float]) -> Any:
-    """Apply a CLI arm-joint rate-limit override, keeping gripper bounds."""
-    if override is None:
-        return configured
-    if override <= 0 or override > 0.1:
-        raise SystemExit("--max-arm-delta must be in (0, 0.1] rad/tick")
-    base = list(configured) if configured is not None else [0.05] * 14
-    for i in list(range(0, 6)) + list(range(7, 13)):
-        base[i] = float(override)
-    return base
 
 
 def resolve_bimanual_execution_mask(
@@ -1799,9 +1782,7 @@ def main() -> None:
         active_arm_side=active_arm_side,
         execution_mode=execution_mode,
         both_arm_active_cli_confirmed=has_explicit_both_arm_cli_opt_in(args),
-        both_arm_max_delta=_apply_max_arm_delta_override(
-            bimanual_cfg.get("both_arm_max_delta"), args.max_arm_delta
-        ),
+        both_arm_max_delta=bimanual_cfg.get("both_arm_max_delta"),
     )
     assert raw_right_cfg is not None  # established by the resolver above
     validate_bimanual_model_arm_order(raw_left_cfg, raw_right_cfg)
