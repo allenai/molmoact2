@@ -659,6 +659,18 @@ class ServoSessionTransport:
             header["frames"] = frames
         return self._request(header, buffers, timeout=self.act_timeout_sec)["prediction"]
 
+    def begin_episode(self) -> bool:
+        """Re-prime the observation wire for a new rollout. See the host method."""
+        if not self.identity:
+            self.open()
+        if self._host is not None:
+            return self._host.begin_episode()
+        return bool(
+            self._request({"op": "begin_episode"}, timeout=self.act_timeout_sec).get(
+                "honoured"
+            )
+        )
+
     def close(self, success: bool = True) -> None:
         """Close the session (and the helper process). Safe to call repeatedly."""
         host, self._host = self._host, None
@@ -925,10 +937,32 @@ class MolmoActServo(PolicyBase):
         self._transport.close(success=success)
 
     def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
-        """Start an isolated deterministic noise stream for this rollout."""
+        """Start an isolated deterministic noise stream for this rollout.
+
+        Also re-primes the observation wire. Seeding the sampler is only half
+        of reproducibility on a codec wire: decoded pixels depend on POSITION
+        in the h264 stream, so without a boundary keyframe two seeded rollouts
+        on one session diverged 0.023 rad (measured thor->odin) where separate
+        sessions were bit-identical.
+        """
         self._rollout_seed = RolloutSeedPlan(rollout_seed).base_seed
         self._inference_index = 0
+        self._seed_proven = False
+        wire_reprimed = None
+        if self.observation_encoding != "jpeg":
+            # Only meaningful on a stateful wire, and only once a session
+            # exists -- the first rollout's first act already starts on an IDR.
+            if self._transport.identity:
+                wire_reprimed = self._transport.begin_episode()
+                if not wire_reprimed:
+                    self.logger.warning(
+                        "this session cannot re-prime the %s wire at a rollout "
+                        "boundary, so a seeded run will NOT replay exactly; "
+                        "update the servo checkout in the bridge interpreter",
+                        self.observation_encoding,
+                    )
         return {
+            "observation_wire_reprimed": wire_reprimed,
             "rollout_seed": self._rollout_seed,
             "query_seed_strategy": SEED_STRATEGY,
             "generator_device": "remote-serve",

@@ -434,6 +434,24 @@ class ServoSessionHost:
             )
         return self._validated_prediction(prediction)
 
+    def begin_episode(self) -> bool:
+        """Re-prime the observation wire at a rollout boundary.
+
+        Returns whether the session could honour it. On a stateful codec wire
+        the decoded pixels depend on POSITION in the stream, so without this
+        two seeded rollouts sharing one session do not replay each other. A
+        session too old to expose it is reported, not silently tolerated: the
+        caller decides whether an unreproducible codec run is acceptable.
+        """
+        session = self._session
+        if session is None:
+            raise ServoBridgeError("begin_episode requested before open")
+        hook = getattr(session, "begin_episode", None)
+        if not callable(hook):
+            return False
+        hook()
+        return True
+
     def _session_accepts_noise_seed(self) -> bool:
         """Whether the bound SDK session takes a per-query seed.
 
@@ -773,6 +791,10 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 noise_seed=header.get("noise_seed"),
             ),
         }
+    if op == "begin_episode":
+        if host is None:
+            raise ServoBridgeError("begin_episode requested before open")
+        return {"ok": True, "honoured": host.begin_episode()}
     if op == "close":
         if host is not None:
             host.close(success=bool(header.get("success", True)))
