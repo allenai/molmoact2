@@ -1052,6 +1052,16 @@ class BimanualActiveArmHoldMask:
                 command = measured + np.clip(delta, -max_delta, max_delta)
                 return command.astype(np.float32, copy=False)
             command[self.active_slice] = action[self.active_slice]
+            # The per-tick rate limit must bound the active arm in EVERY
+            # execution mode, not just "both": until 2026-08-13 single-arm
+            # active_arm_hold sent raw absolute targets, so the configured
+            # max_delta silently did nothing there (discovered after a
+            # table strike at supposedly-clamped speed). The held arm is at
+            # measured feedback, so its delta is zero by construction.
+            if self.both_arm_max_delta is not None:
+                max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
+                delta = command - measured
+                command = measured + np.clip(delta, -max_delta, max_delta)
         return command
 
 
