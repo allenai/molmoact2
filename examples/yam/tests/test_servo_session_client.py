@@ -33,6 +33,7 @@ import unittest.mock
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+from rollout_manifest import SEED_STRATEGY, RolloutSeedPlan
 from servo_session_bridge import (
     ACTION_HORIZON,
     CAMERA_KEYS,
@@ -1074,9 +1075,17 @@ class _StubTransport:
         self.opens += 1
         return dict(self.identity)
 
-    def act(self, images, state, instruction=None):
+    def act(self, images, state, instruction=None, noise_seed=None):
+        # Named explicitly rather than absorbed by **kwargs: a stand-in that
+        # silently accepts a seed it never records is how a dropped seed goes
+        # unnoticed, which is the one failure this whole path exists to catch.
         self.calls.append(
-            {"images": dict(images), "state": list(state), "instruction": instruction}
+            {
+                "images": dict(images),
+                "state": list(state),
+                "instruction": instruction,
+                "noise_seed": noise_seed,
+            }
         )
         if self._prediction is not None:
             return self._prediction
@@ -1246,8 +1255,16 @@ class MolmoActServoTests(unittest.TestCase):
         self.assertEqual(metadata["checkpoint_digest"], "sha256:" + "e" * 64)
         self.assertEqual(metadata["manifest_hash"], "sha256:" + "f" * 64)
         self.assertEqual(metadata["base_url"], _FAKE_BASE_URL)
+        # Unproven before any act: the metadata reports what the serve has
+        # actually demonstrated, not what was asked for.
         self.assertFalse(metadata["deterministic_generator"])
-        self.assertFalse(policy.begin_rollout(7)["deterministic_generator"])
+        self.assertFalse(metadata["seed_requested"])
+        # A seeded rollout now genuinely arms a deterministic stream -- this
+        # used to assert False because the hosted path could not carry a seed.
+        armed = policy.begin_rollout(7)
+        self.assertTrue(armed["deterministic_generator"])
+        self.assertEqual(armed["query_seed_strategy"], SEED_STRATEGY)
+        self.assertTrue(policy.reproducibility_metadata()["seed_requested"])
 
     def test_open_and_close_delegate_to_the_single_session(self):
         policy = self._policy()
@@ -1587,7 +1604,7 @@ class MolmoActServoWireTests(unittest.TestCase):
         captured = {}
         with unittest.mock.patch.object(
             policy._transport, "act",
-            side_effect=lambda images, state, instruction=None: (
+            side_effect=lambda images, state, instruction=None, noise_seed=None: (
                 captured.update(images=images) or _fake_prediction_dict()
             ),
         ):
@@ -1602,7 +1619,7 @@ class MolmoActServoWireTests(unittest.TestCase):
         captured = {}
         with unittest.mock.patch.object(
             policy._transport, "act",
-            side_effect=lambda images, state, instruction=None: (
+            side_effect=lambda images, state, instruction=None, noise_seed=None: (
                 captured.update(images=images) or _fake_prediction_dict()
             ),
         ):
@@ -1635,3 +1652,178 @@ def _fake_prediction_dict():
         "action_space": "joint_position",
         "telemetry": {"server_infer_ms": 12.0, "request_bytes": 4096},
     }
+
+
+@unittest.skipUnless(_HAVE_CLIENT, _CLIENT_SKIP)
+@unittest.skipUnless(_HAVE_NUMPY, "numpy is required for the raw-pixel wire")
+class RemoteNoiseSeedTests(unittest.TestCase):
+    """The remote policy must draw the SAME noise a local one would.
+
+    A thor-local run and a thor->odin run are only comparable as the *same*
+    rollout if both sample from the same stream. MolmoAct2's flow-matching head
+    redraws noise per query, and a single draw moves commanded excursion by
+    0.03-0.68 rad on identical input -- so an unseeded A/B measures the sampler,
+    not the deployment. These tests pin the seed's whole path, including every
+    way it can be silently lost.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = _write_grant(self._dir.name)
+
+    def _policy(self, **kwargs):
+        policy = MolmoActServo(
+            grant=self.grant,
+            servo_python=sys.executable,
+            instruction="pick up the red lid",
+            **kwargs,
+        )
+        policy._transport = _StubTransport(prediction=_seeded_prediction_dict())
+        return policy
+
+    def _observation(self):
+        import numpy as np
+
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        return {
+            "front_camera_rgb": frame,
+            "left_camera_rgb": frame,
+            "right_camera_rgb": frame,
+            "joint_positions": [0.0] * STATE_DIM,
+        }
+
+    def test_query_seeds_match_the_local_policy_exactly(self):
+        """The whole point: same base seed => same per-query seeds, both modes.
+
+        Compared against RolloutSeedPlan directly rather than against a live
+        MolmoActLocal, which would need a GPU and a checkpoint; the plan IS the
+        shared derivation, so agreeing with it is agreeing with local.
+        """
+        base_seed = 1234
+        policy = self._policy()
+        rollout_seed = RolloutSeedPlan(base_seed).rollout_seed(3)
+        policy.begin_rollout(rollout_seed)
+
+        for _ in range(4):
+            policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+
+        sent = [call["noise_seed"] for call in policy._transport.calls]
+        expected = [
+            RolloutSeedPlan(None).query_seed(rollout_seed, index) for index in range(4)
+        ]
+        self.assertEqual(sent, expected)
+        self.assertTrue(all(seed is not None for seed in sent))
+        # Distinct per query -- a constant seed would make every chunk of a
+        # rollout replay one noise draw, which is not what local does.
+        self.assertEqual(len(set(sent)), 4)
+
+    def test_unseeded_rollout_sends_no_seed(self):
+        policy = self._policy()
+        policy.begin_rollout(None)
+        policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        self.assertIsNone(policy._transport.calls[0]["noise_seed"])
+        self.assertFalse(policy.reproducibility_metadata()["seed_requested"])
+
+    def test_begin_rollout_restarts_the_query_stream(self):
+        """Two rollouts on the same seed must replay, not continue."""
+        policy = self._policy()
+        rollout_seed = RolloutSeedPlan(99).rollout_seed(0)
+
+        policy.begin_rollout(rollout_seed)
+        policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        first = policy._transport.calls[-1]["noise_seed"]
+
+        policy.begin_rollout(rollout_seed)
+        policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        self.assertEqual(policy._transport.calls[-1]["noise_seed"], first)
+
+    def test_a_failed_act_does_not_consume_its_seed(self):
+        """A retried act replays its own seed, matching MolmoActLocal."""
+        policy = self._policy()
+        policy.begin_rollout(RolloutSeedPlan(7).rollout_seed(0))
+        observation = policy.prepare_input(self._observation(), "pick up the red lid")
+
+        boom = RuntimeError("transient serve failure")
+        original = policy._transport.act
+        calls = {"n": 0}
+
+        def failing(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise boom
+            return original(*args, **kwargs)
+
+        policy._transport.act = failing
+        with self.assertRaises(RuntimeError):
+            policy.inference(observation)
+        policy.inference(observation)
+
+        replayed = policy._transport.calls[-1]["noise_seed"]
+        self.assertEqual(
+            replayed, RolloutSeedPlan(None).query_seed(policy._rollout_seed, 0)
+        )
+
+    def test_reproducibility_reports_the_seed_as_proven_not_intended(self):
+        policy = self._policy()
+        policy.begin_rollout(RolloutSeedPlan(5).rollout_seed(0))
+        self.assertFalse(policy.reproducibility_metadata()["deterministic_generator"])
+        policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        metadata = policy.reproducibility_metadata()
+        self.assertTrue(metadata["deterministic_generator"])
+        self.assertTrue(metadata["seed_requested"])
+
+    def test_a_serve_that_reports_no_scheme_is_not_counted_as_proven(self):
+        """Belt to the SDK's braces.
+
+        DirectPolicy already refuses a seeded act whose response carries no
+        noise scheme. If that refusal is ever relaxed, the harness must still
+        not claim a reproducibility it cannot demonstrate.
+        """
+        policy = self._policy()
+        policy._transport = _StubTransport(prediction=_fake_prediction_dict())
+        policy.begin_rollout(RolloutSeedPlan(5).rollout_seed(0))
+        policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        self.assertFalse(policy.reproducibility_metadata()["deterministic_generator"])
+
+
+class SessionHostNoiseSeedTests(unittest.TestCase):
+    """A seed the session cannot carry is refused, never dropped."""
+
+    def _host(self, session):
+        host = ServoSessionHost.__new__(ServoSessionHost)
+        host._session = session
+        host.instruction = "pick up the red lid"
+        host.identity = {}
+        return host
+
+    def test_session_without_the_parameter_is_reported_as_unable(self):
+        class _Old:
+            def act(self, observation, instruction=None):
+                raise AssertionError("must not be called")
+
+        self.assertFalse(self._host(_Old())._session_accepts_noise_seed())
+
+    def test_a_kwargs_sink_is_not_trusted(self):
+        """**kwargs accepts the seed and may discard it -- the original defect."""
+
+        class _Sink:
+            def act(self, observation, instruction=None, **kwargs):
+                raise AssertionError("must not be called")
+
+        self.assertFalse(self._host(_Sink())._session_accepts_noise_seed())
+
+    def test_a_seedable_session_is_recognised(self):
+        class _New:
+            def act(self, observation, instruction=None, noise_seed=None):
+                raise AssertionError("must not be called")
+
+        self.assertTrue(self._host(_New())._session_accepts_noise_seed())
+
+
+def _seeded_prediction_dict():
+    """A prediction from a serve that reports the scheme it sampled under."""
+    prediction = _fake_prediction_dict()
+    prediction["telemetry"] = dict(prediction["telemetry"])
+    prediction["telemetry"]["noise_scheme"] = "torch-generator-v1"
+    return prediction

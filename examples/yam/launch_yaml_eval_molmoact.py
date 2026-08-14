@@ -530,6 +530,14 @@ class Args:
     policy_mode: Optional[Literal["local", "server", "http", "direct"]] = None
     """Override eval.mode without editing the physical rollout YAML."""
 
+    seed: Optional[int] = None
+    """Base seed for per-query policy noise. Overrides eval.reproducibility.seed.
+    Both the local and the remote policy derive each query's seed the same way
+    (per_rollout_per_query_v1), so the SAME base seed makes a local run and a
+    thor->odin run draw identical noise -- which is what makes them comparable
+    as anything other than two samples of a stochastic policy. Unset leaves
+    sampling stochastic."""
+
     confirm_bimanual_clearance: bool = False
     """Required for active dual-arm motion after the operator verifies a clear, separated start pose."""
 
@@ -1982,7 +1990,9 @@ def main() -> None:
     raw_left_cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
     eval_cfg = raw_left_cfg.get("eval") or {}
     reproducibility_cfg = eval_cfg.get("reproducibility") or {}
-    seed_plan = RolloutSeedPlan(reproducibility_cfg.get("seed"))
+    seed_plan = RolloutSeedPlan(
+        args.seed if args.seed is not None else reproducibility_cfg.get("seed")
+    )
     process_seed_metadata = configure_process_seed(
         seed_plan,
         deterministic_algorithms=bool(

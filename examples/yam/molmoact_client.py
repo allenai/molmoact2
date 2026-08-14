@@ -608,6 +608,7 @@ class ServoSessionTransport:
         images: Dict[str, Any],
         state: Any,
         instruction: Optional[str] = None,
+        noise_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Send one observation over the open session and return its prediction.
 
@@ -626,11 +627,14 @@ class ServoSessionTransport:
         if missing:
             raise ServoBridgeError(f"Servo observation is missing camera bytes: {missing}")
         if self._host is not None:
-            return self._host.act(images, state, instruction=instruction)
+            return self._host.act(
+                images, state, instruction=instruction, noise_seed=noise_seed
+            )
         header: Dict[str, Any] = {
             "op": "act",
             "state": [float(value) for value in state],
             "instruction": instruction,
+            "noise_seed": None if noise_seed is None else int(noise_seed),
         }
         if self.observation_encoding == "jpeg":
             header["images"] = {key: index for index, key in enumerate(CAMERA_KEYS)}
@@ -853,6 +857,7 @@ class MolmoActServo(PolicyBase):
         image_fit: str = "pad",
         observation_encoding: str = "jpeg",
         h264_crf: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         self.logger = get_molmoact_logger()
         if image_fit not in ("pad", "stretch"):
@@ -873,6 +878,17 @@ class MolmoActServo(PolicyBase):
         self.observation_encoding = str(observation_encoding)
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.action_horizon = ACTION_HORIZON
+        # Seeding mirrors MolmoActLocal exactly -- same RolloutSeedPlan, same
+        # per-query derivation -- because the point is a PAIRED comparison: the
+        # same base seed must produce the same noise draw whether the model runs
+        # on this Jetson or on a remote GPU. Servo's raw-transformers backend
+        # seeds a torch.Generator on the serve the same way MolmoActLocal does
+        # here, so identical query seeds mean identical draws.
+        self._configured_seed_plan = RolloutSeedPlan(seed)
+        self._query_seed_plan = RolloutSeedPlan(None)
+        self._rollout_seed = self._configured_seed_plan.rollout_seed(0)
+        self._inference_index = 0
+        self._seed_proven = False
         self._transport = ServoSessionTransport(
             credentials=(credentials or DEFAULT_SERVO_CREDENTIALS) if not grant else None,
             deployment_id=deployment,
@@ -908,6 +924,27 @@ class MolmoActServo(PolicyBase):
     def close(self, success: bool = True) -> None:
         self._transport.close(success=success)
 
+    def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
+        """Start an isolated deterministic noise stream for this rollout."""
+        self._rollout_seed = RolloutSeedPlan(rollout_seed).base_seed
+        self._inference_index = 0
+        return {
+            "rollout_seed": self._rollout_seed,
+            "query_seed_strategy": SEED_STRATEGY,
+            "generator_device": "remote-serve",
+            "deterministic_generator": self._rollout_seed is not None,
+        }
+
+    def _noise_seed_for_next_query(self) -> tuple[Optional[int], Dict[str, Any]]:
+        query_index = self._inference_index
+        query_seed = self._query_seed_plan.query_seed(self._rollout_seed, query_index)
+        return query_seed, {
+            "rollout_seed": self._rollout_seed,
+            "query_index": query_index,
+            "query_seed": query_seed,
+            "seed_strategy": SEED_STRATEGY,
+        }
+
     def reproducibility_metadata(self) -> Dict[str, Any]:
         identity = self._transport.identity
         return {
@@ -925,8 +962,14 @@ class MolmoActServo(PolicyBase):
                 f"-size-{self.image_size or 'source'}"
             ),
             "observation_encoding": self.observation_encoding,
-            "deterministic_generator": False,
-            "note": "hosted policy does not expose a per-query generator seed",
+            "configured_seed": self._configured_seed_plan.base_seed,
+            "query_seed_strategy": SEED_STRATEGY,
+            # A FACT about acts already returned, not an intention. The serve
+            # reports the scheme it actually sampled under and the SDK refuses
+            # an act whose response does not carry one, so a run that reaches
+            # here with a seed requested is a run whose seed was honoured.
+            "deterministic_generator": self._seed_proven,
+            "seed_requested": self._rollout_seed is not None,
         }
 
     def prepare_input(self, obs: Dict[str, Any], instruction: str) -> Dict[str, Any]:
@@ -968,13 +1011,19 @@ class MolmoActServo(PolicyBase):
             input_dict["state"], source="MolmoActServo request"
         )
 
+        noise_seed, seed_metadata = self._noise_seed_for_next_query()
         act_started = time.perf_counter()
         prediction = self._transport.act(
             images,
             state.tolist(),
             instruction=input_dict.get("instruction"),
+            noise_seed=noise_seed,
         )
         act_ms = (time.perf_counter() - act_started) * 1000.0
+        # Advance only on success, matching MolmoActLocal: a retried act must
+        # replay its own seed, not consume the next one, or a recovered run
+        # silently stops being the run its manifest describes.
+        self._inference_index += 1
 
         actions = np.asarray(prediction["actions"], dtype=np.float32)
         if actions.shape != (ACTION_HORIZON, STATE_DIM) or not np.isfinite(actions).all():
@@ -982,6 +1031,14 @@ class MolmoActServo(PolicyBase):
                 f"Servo returned a malformed action chunk: shape {actions.shape}"
             )
         telemetry = prediction.get("telemetry") or {}
+        # The serve reports the mechanism it actually sampled under. The SDK
+        # already refuses a seeded act whose response carries no scheme, so
+        # reaching here with one recorded is the proof -- not the intent --
+        # that this query's seed reached the sampler.
+        noise_scheme = telemetry.get("noise_scheme")
+        if noise_seed is not None and noise_scheme:
+            self._seed_proven = True
+        seed_metadata["noise_scheme"] = noise_scheme
         # The SDK's ``ActionPrediction.telemetry`` flattens
         # ``runtime.inference_ms`` to the top-level key ``server_infer_ms``
         # (servo/types.py:_telemetry_view) — there is no ``infer_ms`` key.
@@ -1007,7 +1064,7 @@ class MolmoActServo(PolicyBase):
         return {
             "actions": actions,
             "servo": prediction,
-            "reproducibility": self.reproducibility_metadata(),
+            "reproducibility": {**self.reproducibility_metadata(), **seed_metadata},
             "transport": {
                 "protocol": "servo-action-session",
                 "action_space": prediction.get("action_space", ACTION_SPACE),

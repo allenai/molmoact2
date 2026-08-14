@@ -43,6 +43,7 @@ keep the module level to the standard library and import the SDK lazily.
 from __future__ import annotations
 
 import json
+import inspect
 import math
 import struct
 import sys
@@ -388,11 +389,18 @@ class ServoSessionHost:
         images: Mapping[str, Any],
         state: Sequence[float],
         instruction: Optional[str] = None,
+        noise_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Run one action chunk over the open session.
 
         ``images`` carries pre-encoded JPEG bytes (jpeg wire) or raw ``HxWx3``
         ``uint8`` arrays (codec wire); the SDK decides what to do with each.
+
+        ``noise_seed`` seeds the serve's flow-matching noise draw for THIS
+        query, so a remote rollout can be replayed exactly the way a local one
+        can. It is refused rather than dropped when the session cannot carry
+        it: a silently unseeded run looks identical to a seeded one in every
+        artifact, and that is the failure this whole path exists to prevent.
         """
         if self._session is None:
             raise ServoBridgeError("Servo session is not open")
@@ -409,8 +417,47 @@ class ServoSessionHost:
             "state": state_values,
             "instruction": instruction or self.instruction,
         }
-        prediction = self._session.act(observation, instruction=instruction)
+        if noise_seed is None:
+            prediction = self._session.act(observation, instruction=instruction)
+        else:
+            if not self._session_accepts_noise_seed():
+                raise ServoBridgeError(
+                    "a per-query noise seed was requested but this session cannot "
+                    f"carry one ({type(self._session).__name__}.act has no "
+                    "'noise_seed' parameter). Seeded remote rollouts need a servo "
+                    "checkout with DirectPolicy seeding (PR #227 or later) in the "
+                    f"bridge interpreter ({sys.executable}); re-run unseeded, or "
+                    "update that checkout"
+                )
+            prediction = self._session.act(
+                observation, instruction=instruction, noise_seed=int(noise_seed)
+            )
         return self._validated_prediction(prediction)
+
+    def _session_accepts_noise_seed(self) -> bool:
+        """Whether the bound SDK session takes a per-query seed.
+
+        Introspected rather than probed with a TypeError: an internal TypeError
+        raised from deep inside a legitimately-seeded act would otherwise be
+        misreported as "this SDK is too old" and send the operator to update a
+        checkout that was never the problem.
+        """
+        session = self._session
+        if session is None:
+            return False
+        try:
+            signature = inspect.signature(session.act)
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return False
+        for parameter in signature.parameters.values():
+            if parameter.name == "noise_seed":
+                return True
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                # A **kwargs sink accepts the argument and may well discard it.
+                # That is exactly the defect PR #227 removed from DirectPolicy,
+                # so treat it as "cannot carry" rather than trusting it.
+                return False
+        return False
 
     def _validated_prediction(self, prediction: Any) -> Dict[str, Any]:
         actions = [[float(value) for value in row] for row in (prediction.actions or [])]
@@ -723,6 +770,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 images,
                 header.get("state") or [],
                 instruction=header.get("instruction"),
+                noise_seed=header.get("noise_seed"),
             ),
         }
     if op == "close":
