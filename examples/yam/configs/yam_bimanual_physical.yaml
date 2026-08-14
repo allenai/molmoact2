@@ -63,7 +63,7 @@ eval:
     # 0.03 rad/tick cap, but keeps chunk-to-chunk policy reversals from
     # feeling snappy on the real arms. Fields 6 and 13 are normalized gripper
     # apertures.
-    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
+    both_arm_max_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.025, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.025]
   live_view_enabled: false
   # Return both arms to the encoder-measured pose at launcher startup only
   # after a normal, completed session. Faults and Ctrl-C never autonomously
