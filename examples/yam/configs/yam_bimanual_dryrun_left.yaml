@@ -1,0 +1,103 @@
+# Dry-run twin of ``yam_bimanual_physical.yaml``: everything real except the arm.
+#
+# Same cameras, same camera preflight, same 30 Hz loop, same 14-D state/action
+# ordering and the same policy path — but ``robot._target_`` is ``PrintRobot``,
+# which accepts a commanded joint vector and stores it. There is no CAN bus in
+# this config, so no motor can move no matter what the policy asks for.
+#
+# This exists so the first time the demo's commands run is not the first time a
+# robot is standing in front of an audience. Pair it with
+# ``yam_bimanual_dryrun_right.yaml``:
+#
+#   --config-path       configs/yam_bimanual_dryrun_left.yaml
+#   --right-config-path configs/yam_bimanual_dryrun_right.yaml
+#   --policy-mode direct --servo-grant <grant>
+#
+# State/action field order is fixed by the checkpoint:
+#   0:7   physical left arm  (this config)
+#   7:14  physical right arm
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (model ``left_cam``)
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      # D435 serial 250423122040 (model ``top_cam``)
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      # D405 serial 402323071794 (model ``right_cam``)
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.robot.PrintRobot
+  num_dofs: 7
+  # The commanded vector is stored and readable; printing it at 30 Hz would
+  # bury the per-act latency the dry run exists to show.
+  dont_print: true
+
+agent:
+  start_joints: null
+
+hz: 30
+# ~30 s of loop at 30 Hz: long enough for a stable per-act p50 across several
+# chunk boundaries, short enough to run twice before a demo.
+max_steps: 900
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "red_lid_bimanual_dryrun"
+  language_instruction: "Using both arms, coordinate to pick up the red lid, place it fully on top of the black box, release it, then move both arms away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "molmoact_bimanual_yam"
+  hf_repo_id: "local/yam_eval_dryrun"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  bimanual:
+    active_arm_side: both
+    execution_mode: shadow
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
+  live_view_enabled: false
+  # Nothing to return: PrintRobot has no pose to restore.
+  return_to_rest_on_exit: false
+  return_to_rest_max_joint_step: 0.01
+  reproducibility:
+    seed: 20260727
+    deterministic_algorithms: false
+  # Kept ON deliberately. The cameras are the one piece of real hardware in a
+  # dry run, and a white or unsettled frame is exactly the failure this run is
+  # meant to catch before the live one.
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: false
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 15
+  # Overridden on the command line to ``direct`` with a `servo serve` grant.
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: true
+    warmup: true
+  camera_server:
+    enabled: false

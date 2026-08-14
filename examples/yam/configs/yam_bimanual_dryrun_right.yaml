@@ -1,0 +1,78 @@
+# Dry-run twin of ``yam_right_primary.yaml``: everything real except the arm.
+#
+# ``robot._target_`` is ``PrintRobot``, which accepts a commanded joint vector
+# and stores it. There is no CAN bus in this config, so no motor can move no
+# matter what the policy asks for. Cameras, camera preflight, the 30 Hz loop and
+# the whole policy path are real.
+#
+# Supply as ``--right-config-path`` alongside ``yam_bimanual_dryrun_left.yaml``:
+# state/action fields 7:14 are the physical right arm.
+model_arm_side: right
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (left wrist view / model ``left_cam``)
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      # D435 serial 250423122040 (static overhead view / model ``top_cam``)
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      # D405 serial 402323071794 (right wrist view / model ``right_cam``)
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.robot.PrintRobot
+  num_dofs: 7
+  # The commanded vector is stored and readable; printing it at 30 Hz would
+  # bury the per-act latency the dry run exists to show.
+  dont_print: true
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 900
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "red_lid_dryrun_right"
+  language_instruction: "Using the right arm, pick up the red lid, place it fully on top of the black box, open the gripper to release it, then move the arm away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "molmoact_right_arm"
+  hf_repo_id: "local/yam_eval_dryrun"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: false
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: false
+    warmup: true
+  camera_server:
+    enabled: false
