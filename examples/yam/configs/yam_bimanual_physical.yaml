@@ -14,13 +14,13 @@ sensors:
   cameras:
     left_camera:
       # D405 serial 402323071792 (model ``left_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071792-video-index4"
+      device_id: "/dev/yam-cameras/left"
     front_camera:
       # D435 serial 250423122040 (model ``top_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_435_Intel_R__RealSense_TM__Depth_Camera_435_250423122040-video-index0"
+      device_id: "/dev/yam-cameras/middle"
     right_camera:
       # D405 serial 402323071794 (model ``right_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071794-video-index4"
+      device_id: "/dev/yam-cameras/right"
 
 robot:
   _target_: gello_min.yam.YAMRobot
@@ -63,7 +63,7 @@ eval:
     # 0.03 rad/tick cap, but keeps chunk-to-chunk policy reversals from
     # feeling snappy on the real arms. Fields 6 and 13 are normalized gripper
     # apertures.
-    both_arm_max_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.025, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.025]
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
   live_view_enabled: false
   # Return both arms to the encoder-measured pose at launcher startup only
   # after a normal, completed session. Faults and Ctrl-C never autonomously
