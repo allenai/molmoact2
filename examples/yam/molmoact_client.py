@@ -157,13 +157,16 @@ class MolmoActHTTP(PolicyBase):
         # MolmoAct2-BimanualYAM's own image processor (crop_mode "resize")
         # squishes whatever arrives down to this size before the vision
         # tower ever sees it (checkpoint's processor_config.json /
-        # vit_config.image_default_input_size). Unlike the Servo path, which
-        # deliberately ships source resolution because the managed runtime
-        # owns model-specific resize/padding, there is no such runtime here
-        # -- every pixel sent past 378x378 is pure wasted wire time. Pass
-        # ``None`` to send source resolution (e.g. to compare against a
-        # different checkpoint's input size).
-        image_size: Optional[Tuple[int, int]] = (378, 378),
+        # Default None: ship SOURCE resolution and let the checkpoint's own
+        # processor do its trained 640x360->378x378 bilinear stretch.
+        # Measured 2026-08-14 (thor + odin, 10 draws each at the carry
+        # fixture): a client-side LANCZOS pre-resize to 378x378 shifts the
+        # gripper-open mode fraction +0.3-0.4 on BOTH machines, while
+        # native-resolution q85 JPEG is behaviorally indistinguishable from
+        # lossless PNG. The wire cost of native 640x360 over 378x378 is
+        # ~1.6x pixels -- noise next to the behavioral shift. Pass an
+        # explicit (H, W) only for bandwidth experiments, never for rollouts.
+        image_size: Optional[Tuple[int, int]] = None,
     ):
         self.logger = get_molmoact_logger()
         if request_timeout_sec <= 0:
