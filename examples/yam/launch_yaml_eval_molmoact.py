@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -1360,6 +1360,36 @@ def run_one_rollout(
         reproducibility = policy_result.get("reproducibility", {})
         if not isinstance(reproducibility, dict):
             reproducibility = {"metadata_error": "policy returned non-mapping reproducibility metadata"}
+        # Two facts about this query that the rollout used to discard, and that
+        # a replay cannot be built without.
+        #
+        # 1. THE STATE THE MODEL SAW. ``obs_pre`` is refreshed from the encoders
+        #    after inference (see refresh_robot_feedback_after_inference below),
+        #    so the 14-D vector reaching the saver at a chunk boundary is NOT the
+        #    one this query consumed. ``input_dict`` is, and every client builds
+        #    it the same way.
+        # 2. PER-ACT TRANSPORT TELEMETRY. The Servo client already measures
+        #    act_ms / encode_ms / server_inference_ms / image_bytes per act and
+        #    the launcher dropped all of it on the floor.
+        #
+        # Both are already in hand, so this costs a dict build on a path that
+        # just spent 100+ ms in the model.
+        record: Dict[str, Any] = {
+            "policy_input_state": [
+                float(value)
+                for value in np.asarray(input_dict.get("state", ())).reshape(-1)
+            ],
+            "policy_input_camera_shapes": {
+                key: list(np.asarray(value).shape)
+                for key, value in input_dict.items()
+                if key.endswith("_rgb") and hasattr(value, "shape")
+            },
+            "instruction_sent": input_dict.get("instruction", instruction),
+        }
+        transport = policy_result.get("transport")
+        if isinstance(transport, Mapping):
+            record["transport"] = dict(transport)
+        reproducibility = {**reproducibility, **record}
         return np.asarray(result, dtype=np.float32), inference_sec, reproducibility
 
     prefetch_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -1510,7 +1540,14 @@ def run_one_rollout(
             # Fresh observation captured NOW (main thread), inference overlapped
             # with the remainder of this chunk's execution. One in flight max.
             prefetch_capture_step = step
-            prefetch_future = prefetch_pool.submit(infer, env.get_obs())
+            prefetch_observation = env.get_obs()
+            # The main loop saves ``obs_pre`` for this step; this is a second,
+            # later capture that only the policy sees. Saving it under its own
+            # camera keys is what makes a prefetched act replayable at all --
+            # and it rides the saver's existing bounded async writer, so the
+            # control loop pays a queue put, not a PNG encode.
+            saver.add_policy_observation(step, prefetch_observation)
+            prefetch_future = prefetch_pool.submit(infer, prefetch_observation)
 
         action_index_in_chunk = chunk_index
         policy_action = action_chunk[action_index_in_chunk]

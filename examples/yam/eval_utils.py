@@ -328,6 +328,24 @@ class EvalRolloutSaver:
                 self._schedule_camera_frame(cam_key, step, img)
         self._buffer.append(record)
 
+    def add_policy_observation(self, step: int, obs: Mapping[str, Any]) -> None:
+        """Save the frames a PREFETCHED policy query consumed.
+
+        The control loop saves ``obs_pre`` for each step. A prefetched query
+        runs against a *later* capture taken on the prefetch thread, so the
+        step's saved PNG is not the image that produced that chunk. Replaying a
+        prefetched act from it compares the model against pixels it never saw --
+        exactly the kind of confound that has cost this project whole sessions.
+
+        Written under ``<camera>_policy/`` rather than overwriting the control
+        record: both captures are real and a diagnosis may need either.
+        """
+
+        for obs_key, cam_key in self.CAMERA_OBS_TO_KEY.items():
+            image = obs.get(obs_key)
+            if image is not None:
+                self._schedule_camera_frame(f"{cam_key}_policy", step, image)
+
     def add_policy_action_chunk(
         self,
         start_step: int,
