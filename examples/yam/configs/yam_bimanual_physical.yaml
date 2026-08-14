@@ -85,7 +85,7 @@ eval:
     enabled: true
     image_stride: 6
     jpeg_quality: 75
-    action_chunk_size: 30
+    action_chunk_size: 15
   mode: local
   local:
     repo_id: "allenai/MolmoAct2-BimanualYAM"
