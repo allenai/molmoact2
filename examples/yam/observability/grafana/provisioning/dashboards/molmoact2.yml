@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: MolmoAct2
+    orgId: 1
+    folder: Servo
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

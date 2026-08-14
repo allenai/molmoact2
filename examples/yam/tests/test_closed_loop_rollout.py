@@ -325,6 +325,74 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         self.assertFalse(metadata["enabled"])
         self.assertNotIn("max_delta", metadata)
 
+    def test_single_arm_active_hold_rate_limits_the_active_side_only(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="left",
+            execution_mode="active_arm_hold",
+            both_arm_max_delta=0.05,
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.full(14, 0.523, dtype=np.float32)
+
+        applied = mask.command_target(action, measured)
+        # Active (left) half is clipped to the tuned per-tick rate limit; the
+        # inactive (right) half stays at live feedback regardless of the
+        # policy's raw prediction, exactly like the unclamped default.
+        np.testing.assert_allclose(applied[:7], np.full(7, 0.05, dtype=np.float32))
+        np.testing.assert_array_equal(applied[7:], measured[7:])
+
+    def test_single_arm_active_hold_without_rate_limit_is_unchanged(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="right",
+            execution_mode="active_arm_hold",
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.full(14, 0.523, dtype=np.float32)
+
+        applied = mask.command_target(action, measured)
+        # No both_arm_max_delta configured: identical to the pre-fix direct
+        # assignment, so single-arm-only configs (no eval.bimanual section)
+        # keep behaving exactly as before.
+        np.testing.assert_array_equal(applied[7:], action[7:])
+        np.testing.assert_array_equal(applied[:7], measured[:7])
+
+    def test_both_arm_rate_limit_only_clips_the_first_tick_of_a_chunk(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="both",
+            execution_mode="active_arm_hold",
+            both_arm_max_delta=0.05,
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.clip(
+            np.full(14, 0.2, dtype=np.float32),
+            np.asarray(launcher.BIMANUAL_YAM_ACTION_LOWER, dtype=np.float32),
+            np.asarray(launcher.BIMANUAL_YAM_ACTION_UPPER, dtype=np.float32),
+        )
+        first = mask.command_target(action, measured, first_tick_of_chunk=True)
+        np.testing.assert_allclose(first, np.full(14, 0.05, dtype=np.float32))
+        # A later tick in the same chunk is the checkpoint's own already-
+        # coherent within-chunk trajectory; it must reach the motors as
+        # predicted, not re-clipped against live feedback tick by tick.
+        rest = mask.command_target(action, measured, first_tick_of_chunk=False)
+        np.testing.assert_array_equal(rest, action)
+
+    def test_single_arm_rate_limit_only_clips_the_first_tick_of_a_chunk(self):
+        mask = launcher.BimanualActiveArmHoldMask(
+            active_arm_side="left",
+            execution_mode="active_arm_hold",
+            both_arm_max_delta=0.05,
+        )
+        measured = np.zeros(14, dtype=np.float32)
+        action = np.full(14, 0.523, dtype=np.float32)
+
+        first = mask.command_target(action, measured, first_tick_of_chunk=True)
+        np.testing.assert_allclose(first[:7], np.full(7, 0.05, dtype=np.float32))
+
+        rest = mask.command_target(action, measured, first_tick_of_chunk=False)
+        np.testing.assert_array_equal(rest[:7], action[:7])
+        # The held (inactive) side is unaffected by tick position either way.
+        np.testing.assert_array_equal(rest[7:], measured[7:])
+
     def test_return_to_captured_rest_pose_uses_bounded_robot_only_commands(self):
         env = _OneDofEnv()
         env.position = np.array([0.025], dtype=np.float32)
@@ -501,7 +569,11 @@ class RolloutRecordingTests(unittest.TestCase):
                 np.testing.assert_allclose(h5["action"][:], [[0.25]])
 
     def test_session_keyboard_interrupt_is_not_clean_exit(self):
-        """Ctrl-C saves partial artifacts but must not enable teardown motion."""
+        """Ctrl-C saves partial artifacts, is never reported as a policy
+
+        success, but is distinguished from an unknown-cause fault so
+        teardown may still attempt the bounded return-to-rest motion.
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             left_cfg = {
@@ -544,6 +616,7 @@ class RolloutRecordingTests(unittest.TestCase):
                 )
 
             self.assertFalse(result.clean_exit)
+            self.assertTrue(result.interrupted_by_user)
             self.assertEqual(len(result.saved_rollouts), 1)
             rollout_dir = result.saved_rollouts[0]
             self.assertTrue((rollout_dir / "episode.h5").is_file())

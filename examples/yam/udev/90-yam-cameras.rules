@@ -1,0 +1,12 @@
+# Stable RGB camera aliases for the physical bimanual YAM setup.
+# Side convention: standing behind the arms and facing into the workspace.
+
+# Left-wrist D405. Its RGB endpoint is V4L2 index 4 on USB interface 00.
+ACTION=="add|change", SUBSYSTEM=="video4linux", KERNEL=="video*", ENV{ID_SERIAL_SHORT}=="402323071792", ENV{ID_USB_INTERFACE_NUM}=="00", ATTR{index}=="4", SYMLINK+="yam-cameras/left"
+
+# Middle/overhead D435. Match USB interface 03 to avoid the D435 depth/RGB
+# by-id collision; its RGB endpoint is V4L2 index 0 on that interface.
+ACTION=="add|change", SUBSYSTEM=="video4linux", KERNEL=="video*", ENV{ID_SERIAL_SHORT}=="250423122040", ENV{ID_USB_INTERFACE_NUM}=="03", ATTR{index}=="0", SYMLINK+="yam-cameras/middle"
+
+# Right-wrist D405. Its RGB endpoint is V4L2 index 4 on USB interface 00.
+ACTION=="add|change", SUBSYSTEM=="video4linux", KERNEL=="video*", ENV{ID_SERIAL_SHORT}=="402323071794", ENV{ID_USB_INTERFACE_NUM}=="00", ATTR{index}=="4", SYMLINK+="yam-cameras/right"

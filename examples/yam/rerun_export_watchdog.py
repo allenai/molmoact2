@@ -145,9 +145,11 @@ def export_rollout(
 ) -> bool:
     """Export one directory, falling back to an honest incomplete RRD.
 
-    Returns ``True`` only once a nonempty final ``rollout.rrd`` exists.  The
-    caller can safely retry a ``False`` result after transient filesystem or
-    Rerun errors.
+    Returns ``True`` once a nonempty final ``rollout.rrd`` exists, or once a
+    prior attempt already recorded a terminal ``"error"`` (both the full and
+    fallback paths raised — deterministic, e.g. a corrupted source PNG, so
+    retrying changes nothing). ``False`` means genuinely still pending: the
+    caller can safely retry it after transient filesystem or Rerun errors.
     """
     output_path = rollout_dir / "rollout.rrd"
     if _is_nonempty_file(output_path):
@@ -158,6 +160,13 @@ def export_rollout(
             output=output_path.name,
         )
         return True
+    status_path = rollout_dir / STATUS_FILENAME
+    if _is_nonempty_file(status_path):
+        try:
+            if json.loads(status_path.read_text(encoding="utf-8")).get("state") == "error":
+                return True
+        except (OSError, json.JSONDecodeError):
+            pass
 
     lock_path = _acquire_lock(rollout_dir)
     if lock_path is None:
@@ -190,6 +199,14 @@ def export_rollout(
                         jpeg_quality=jpeg_quality,
                     )
                 except Exception as fallback_error:  # noqa: BLE001 - persisted below
+                    # Both the full export and the fallback camera-only
+                    # recovery raised. Unlike a transient I/O error, this is
+                    # deterministic (e.g. a genuinely corrupted source PNG)
+                    # and will fail identically on every future retry.
+                    # Recording it and returning True stops every watchdog
+                    # process on this root from retrying it forever; a human
+                    # can inspect rerun_export.status.json's "error" state
+                    # and fix/remove the bad frame to force a fresh attempt.
                     _write_status(
                         rollout_dir,
                         "error",
@@ -197,7 +214,7 @@ def export_rollout(
                         fallback_error=_short_error(fallback_error),
                         traceback=traceback.format_exc(limit=8),
                     )
-                    return False
+                    return True
                 _write_status(
                     rollout_dir,
                     "complete",

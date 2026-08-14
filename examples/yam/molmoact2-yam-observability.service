@@ -1,0 +1,22 @@
+[Unit]
+Description=Prometheus and Grafana for the Servo MolmoAct2 YAM endpoint
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/home/npow/.config/servo/molmoact2-grafana.env
+ExecStartPre=-/usr/bin/docker rm -f molmoact2-grafana molmoact2-prometheus
+ExecStartPre=-/usr/bin/docker network create molmoact2-observability
+ExecStartPre=/usr/bin/docker pull ${PROMETHEUS_IMAGE}
+ExecStartPre=/usr/bin/docker pull ${GRAFANA_IMAGE}
+ExecStart=/usr/bin/docker run -d --name molmoact2-prometheus --restart unless-stopped --network molmoact2-observability --add-host host.docker.internal:host-gateway --cpus 1 --memory 1g -p 127.0.0.1:9090:9090 -v /home/npow/code/molmoact2/examples/yam/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro -v molmoact2-prometheus-data:/prometheus ${PROMETHEUS_IMAGE} --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d
+ExecStart=/usr/bin/docker run -d --name molmoact2-grafana --restart unless-stopped --network molmoact2-observability --cpus 1 --memory 1g -p 127.0.0.1:3000:3000 --env-file /home/npow/.config/servo/molmoact2-grafana.env -v molmoact2-grafana-data:/var/lib/grafana -v /home/npow/code/molmoact2/examples/yam/observability/grafana/provisioning:/etc/grafana/provisioning:ro -v /home/npow/code/molmoact2/examples/yam/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro ${GRAFANA_IMAGE}
+ExecStop=-/usr/bin/docker rm -f molmoact2-grafana molmoact2-prometheus
+TimeoutStartSec=900
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

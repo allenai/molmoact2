@@ -13,16 +13,18 @@
 model_arm_side: left
 
 sensors:
+  # Physical side convention: left/right while standing behind the arms and
+  # facing into the workspace.
   cameras:
     left_camera:
       # D405 serial 402323071792 (left wrist view / model ``left_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071792-video-index4"
+      device_id: "/dev/yam-cameras/left"
     front_camera:
       # D435 serial 250423122040 (static overhead view / model ``top_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_435_Intel_R__RealSense_TM__Depth_Camera_435_250423122040-video-index0"
+      device_id: "/dev/yam-cameras/middle"
     right_camera:
       # D405 serial 402323071794 (right wrist view / model ``right_cam``)
-      device_id: "/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_402323071794-video-index4"
+      device_id: "/dev/yam-cameras/right"
 
 robot:
   _target_: gello_min.yam.YAMRobot

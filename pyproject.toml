@@ -20,6 +20,7 @@ dependencies = [
     "fastapi>=0.116",
     "uvicorn[standard]>=0.35",
     "json-numpy>=2.1.0",
+    "prometheus-client>=0.21",
     "mani-skill>=3.0.1",
     "tyro>=1.0.13",
     "imageio>=2.37.3",

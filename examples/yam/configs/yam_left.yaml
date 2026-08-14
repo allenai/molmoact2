@@ -54,11 +54,25 @@ eval:
   live_view_enabled: true     # show the 3-pane cv2 window during rollouts
 
   # How inference runs:
-  #   server -> POST observations to a running host_server_yam.py (default)
+  #   server -> hosted policy over one official Servo action session (default)
+  #   http   -> POST observations to a running host_server_yam.py
   #   local  -> load the checkpoint in-process via transformers
-  mode: server
+  mode: http
 
-  # Used when mode == server. Accepts a full URL, a bare host:port, or an
+  # Used when mode == server. The deployment must be a managed Servo hosted
+  # deployment serving MolmoAct2 on the YAM embodiment; the SDK opens one
+  # action session against it and reuses it for every action chunk.
+  # CLI overrides: --servo-deployment / --servo-credentials / --servo-python.
+  server:
+    deployment: null                                       # dep_...
+    credentials: "~/.config/servo/molmoact2-yam-sdk.json"  # SDK machine key, mode 0600
+    # Interpreter with servo-client installed; only needed when the robot
+    # runtime is older than Python 3.12.
+    servo_python: null
+    jpeg_quality: 85           # three-camera payload ~87 KiB at 85, ~65 KiB at 75
+    image_size: null           # null keeps source resolution; Servo owns preprocessing
+
+  # Used when mode == http. Accepts a full URL, a bare host:port, or an
   # ngrok hostname; "/act" is appended automatically. Defaults to the local
   # server's default port if omitted.
   molmoact_server: "127.0.0.1:8202"

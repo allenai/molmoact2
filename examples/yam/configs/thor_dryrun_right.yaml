@@ -1,0 +1,7 @@
+robot:
+  _target_: gello_min.robot.PrintRobot
+  num_dofs: 7
+agent:
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+hz: 10
+max_steps: 30

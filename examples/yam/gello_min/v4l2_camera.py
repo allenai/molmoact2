@@ -47,7 +47,10 @@ class V4L2Camera:
         self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_FPS, min(fps, 5))
+        # fps is honored as requested; 5 remains the default (the USB-safe
+        # bandwidth guard). Raising it is an explicit operator choice: watch
+        # for read stalls (the 2026-07 multi-camera USB starvation mode).
+        self._cap.set(cv2.CAP_PROP_FPS, int(fps))
         # A one-frame kernel buffer prevents a delayed consumer from reading a
         # long queue of old images once control resumes.
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -58,7 +61,7 @@ class V4L2Camera:
         self._stop_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
 
-        self._capture_period_sec = 1.0 / max(1, min(int(fps), 5))
+        self._capture_period_sec = 1.0 / max(1, int(fps))
         self._read_wait_timeout_sec = float(read_wait_timeout_sec)
         self._max_frame_age_sec = float(max_frame_age_sec)
         self._latest_rgb: Optional[np.ndarray] = None

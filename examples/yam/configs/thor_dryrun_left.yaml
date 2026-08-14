@@ -1,0 +1,41 @@
+sensors:
+  cameras:
+    left_camera: {device_id: "/dev/video10"}
+    front_camera: {device_id: "/dev/video4"}
+    right_camera: {device_id: "/dev/video16"}
+robot:
+  _target_: gello_min.robot.PrintRobot
+  num_dofs: 7
+agent:
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+hz: 10
+max_steps: 30
+storage:
+  base_dir: "/home/npow/molmoact2-yam-runs"
+  task_directory: "dryrun"
+  language_instruction: "pick up the object and place it in the bowl"
+  saver_max_workers: 1
+  png_compress_level: 1
+lerobot:
+  fps: 10
+  robot_type: "molmoact_dual_arm"
+  hf_repo_id: "local/yam_dryrun"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 1
+  image_writer_threads: 1
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+eval:
+  live_view_enabled: false
+  mode: local
+  molmoact_server: "127.0.0.1:8202"
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: false
+    warmup: false
+  camera_server:
+    enabled: false

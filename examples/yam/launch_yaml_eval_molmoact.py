@@ -17,6 +17,7 @@ CLI::
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import json
 import logging
 import os
@@ -49,7 +50,7 @@ from eval_utils import (
 from gello_min.robot import BimanualRobot
 from gello_min.launch_utils import instantiate_from_dict, move_to_start_position
 from gello_min.logging_utils import log_collect_demos
-from molmoact_client import MolmoAct, MolmoActLocal
+from molmoact_client import MolmoActHTTP, MolmoActLocal, MolmoActServo, PolicyBase
 from rollout_manifest import (
     RolloutSeedPlan,
     build_rollout_manifest,
@@ -139,6 +140,7 @@ class _DisabledCamera:
 # ---------------------------------------------------------------------------
 
 _env: Optional[RobotEnv] = None
+_policy: Optional[PolicyBase] = None
 _bimanual: bool = False
 _left_cfg: Optional[Dict[str, Any]] = None
 _right_cfg: Optional[Dict[str, Any]] = None
@@ -303,7 +305,7 @@ def _park_robot() -> None:
 
 
 def _shutdown_runtime() -> None:
-    """Park if requested, then deterministically release robot and cameras.
+    """Park if requested, then deterministically release robot, cameras, policy.
 
     ``MotorChainRobot`` owns a non-daemon control thread. This must run in an
     explicit ``finally`` in ``main``; an atexit hook alone is too late because
@@ -315,12 +317,26 @@ def _shutdown_runtime() -> None:
     _resources_closed = True
 
     _park_robot()
-    if _env is None:
-        return
     try:
-        _env.close()
+        if _env is not None:
+            _env.close()
     except Exception as exc:  # noqa: BLE001 — all teardown is best-effort
         logger.warning("Runtime close failed: %s", exc)
+    # The robot is released first; the policy close is a network round trip
+    # (a Servo action session is completed on the control plane) and must
+    # never delay motor release.
+    if _policy is not None:
+        try:
+            # ``_rest_return_eligible`` is set from ``session_result.clean_exit``
+            # right before this runs (main's ``finally``) — it is the only
+            # place that knows whether the run actually completed. Any other
+            # exit path (an exception, Ctrl-C, or a fault before that
+            # assignment) leaves it at its False default, so a policy that
+            # records the outcome remotely (a Servo action session) reports
+            # failure rather than defaulting every abort to "success".
+            _policy.close(success=_rest_return_eligible)
+        except Exception as exc:  # noqa: BLE001 — all teardown is best-effort
+            logger.warning("Policy close failed: %s", exc)
 
 
 def _tail_text(path: Path, limit: int = 2000) -> str:
@@ -449,6 +465,40 @@ class Args:
 
     execution_mode: Optional[Literal["active_arm_hold", "shadow"]] = None
     """Bimanual mode only: ``shadow`` holds both arms; ``active_arm_hold`` executes active halves."""
+
+    molmoact_server: Optional[str] = None
+    """``http`` mode only: override eval.molmoact_server for the self-hosted server."""
+
+    servo_deployment: Optional[str] = None
+    """Managed Servo deployment id serving MolmoAct2 on YAM (``server`` mode)."""
+
+    servo_credentials: Optional[str] = None
+    """Servo SDK machine-key file; default ~/.config/servo/molmoact2-yam-sdk.json."""
+
+    servo_grant: Optional[str] = None
+    """Self-hosted `servo serve` grant file (``direct`` mode); no control plane, no fallback."""
+
+    servo_python: Optional[str] = None
+    """Python >= 3.12 interpreter with servo-client, if this runtime lacks it."""
+
+    prefetch_lead_steps: int = 0
+    """Fire the next inference this many control steps BEFORE the current chunk
+    ends, from a fresh observation captured at that moment, and splice the reply
+    in at the row matching elapsed wall-clock — continuous motion, no boundary
+    freeze. ON by default (18 steps = 0.6 s at 30 Hz, covering the ~0.5 s act).
+    Set 0 for the legacy stop-and-replan behavior. The historical prefetch was
+    reverted because it entered the new absolute-pose chunk at row 0 and drove
+    the arm backward; the elapsed-row splice is the fix (servo run_chunked's
+    design)."""
+
+    replan_settle_s: float = 0.0
+    """Dwell this long at each chunk boundary (after the first) before capturing the
+    replan observation. A fast remote policy replans ~150 ms after the last command
+    while a local policy's ~1 s inference acts as a built-in settle period; this flag
+    reproduces that dwell so the two modes sample the policy from equivalent states."""
+
+    policy_mode: Optional[Literal["local", "server", "http", "direct"]] = None
+    """Override eval.mode without editing the physical rollout YAML."""
 
     confirm_bimanual_clearance: bool = False
     """Required for active dual-arm motion after the operator verifies a clear, separated start pose."""
@@ -654,7 +704,7 @@ def _build_env(
         device_ids = [str(camera_cfg[name]["device_id"]) for name in camera_names]
         if all(device.startswith("/dev/") for device in device_ids):
             camera_dict = {
-                name: (_DisabledCamera() if not bool(camera_cfg[name].get("enabled", True)) else V4L2Camera(device))
+                name: (_DisabledCamera() if not bool(camera_cfg[name].get("enabled", True)) else V4L2Camera(device, fps=int(camera_cfg[name].get("fps", 5))))
                 for name, device in zip(camera_names, device_ids)
             }
             print(f"Using Jetson V4L2 RGB cameras: {device_ids} (disabled={[n for n in camera_names if not bool(camera_cfg[n].get('enabled', True))]})")
@@ -1153,7 +1203,7 @@ def refresh_robot_feedback_after_inference(
 
 def run_one_rollout(
     env: RobotEnv,
-    policy: MolmoAct,
+    policy: PolicyBase,
     saver: EvalRolloutSaver,
     instruction: str,
     rollout_idx: int,
@@ -1161,6 +1211,8 @@ def run_one_rollout(
     max_steps: int,
     live_view: LiveCameraView,
     execution_mask: Optional[BimanualActiveArmHoldMask] = None,
+    replan_settle_s: float = 0.0,
+    prefetch_lead_steps: int = 0,
 ) -> RolloutOutcome:
     """Execute one rollout and buffer per-step observations into ``saver``.
 
@@ -1196,6 +1248,13 @@ def run_one_rollout(
             reproducibility = {"metadata_error": "policy returned non-mapping reproducibility metadata"}
         return np.asarray(result, dtype=np.float32), inference_sec, reproducibility
 
+    prefetch_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    prefetch_future: Optional[concurrent.futures.Future] = None
+    prefetch_capture_step: Optional[int] = None
+    chunk_start_row = 0
+    if prefetch_lead_steps > 0:
+        prefetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
     for step in range(max_steps):
         # MolmoAct's YAM checkpoint predicts *absolute* joint targets.  A
         # prediction prefetched before the current chunk finishes is therefore
@@ -1207,13 +1266,45 @@ def run_one_rollout(
         if action_chunk is None or chunk_index >= len(action_chunk):
             if action_chunk is not None and chunk_started_at is not None:
                 execution_sec = time.monotonic() - chunk_started_at
+                rows_run = len(action_chunk) - chunk_start_row
                 logger.info(
-                    "Completed %d action commands in %.3fs (%.2f Hz)",
+                    "Completed %d/%d action commands in %.3fs (%.2f Hz)",
+                    rows_run,
                     len(action_chunk),
                     execution_sec,
-                    len(action_chunk) / max(execution_sec, 1e-6),
+                    rows_run / max(execution_sec, 1e-6),
                 )
-            action_chunk, policy_inference_sec, policy_inference_metadata = infer(obs_pre)
+                if replan_settle_s > 0 and prefetch_future is None:
+                    # Let the arm settle, then replan from a fresh post-settle
+                    # observation — reproducing the implicit dwell a slow local
+                    # policy provides. Skipped before the first chunk (nothing
+                    # has moved yet).
+                    time.sleep(replan_settle_s)
+                    obs_pre = env.get_obs()
+            splice_index = 0
+            if prefetch_future is not None:
+                action_chunk, policy_inference_sec, policy_inference_metadata = (
+                    prefetch_future.result()
+                )
+                # Enter the prefetched absolute-pose chunk at the row matching
+                # wall-clock progress since its observation was captured: the
+                # earlier rows describe poses already in the past and would
+                # command the arm backward.
+                elapsed_rows = max(0, step - int(prefetch_capture_step))
+                splice_index = min(elapsed_rows, len(action_chunk) - 1)
+                policy_inference_metadata = {
+                    **(policy_inference_metadata or {}),
+                    "prefetch_splice_index": int(splice_index),
+                    "prefetch_capture_step": int(prefetch_capture_step),
+                }
+                prefetch_future = None
+                prefetch_capture_step = None
+                logger.info(
+                    "Spliced prefetched plan at row %d (continuous motion)",
+                    splice_index,
+                )
+            else:
+                action_chunk, policy_inference_sec, policy_inference_metadata = infer(obs_pre)
             expected_dofs = env.robot().num_dofs()
             if execution_mask is not None:
                 # Do this at every inference boundary as well as per tick so
@@ -1231,7 +1322,8 @@ def run_one_rollout(
                     "Policy returned an invalid action chunk: "
                     f"shape={action_chunk.shape}, expected (N, {expected_dofs}) finite values"
             )
-            chunk_index = 0
+            chunk_index = splice_index
+            chunk_start_row = splice_index
             policy_chunk_index += 1
             saver.add_policy_action_chunk(
                 start_step=step,
@@ -1281,6 +1373,18 @@ def run_one_rollout(
                     float(np.max(gripper_targets)),
                 )
             chunk_started_at = time.monotonic()
+
+        if (
+            prefetch_pool is not None
+            and prefetch_future is None
+            and action_chunk is not None
+            and (len(action_chunk) - chunk_index)
+            <= min(max(1, prefetch_lead_steps), len(action_chunk) - 1)
+        ):
+            # Fresh observation captured NOW (main thread), inference overlapped
+            # with the remainder of this chunk's execution. One in flight max.
+            prefetch_capture_step = step
+            prefetch_future = prefetch_pool.submit(infer, env.get_obs())
 
         action_index_in_chunk = chunk_index
         policy_action = action_chunk[action_index_in_chunk]
@@ -1373,7 +1477,7 @@ def with_active_single_arm_instruction(
 
 def run_session(
     env: RobotEnv,
-    policy: MolmoAct,
+    policy: PolicyBase,
     left_cfg: Dict[str, Any],
     right_cfg: Optional[Dict[str, Any]],
     bimanual: bool,
@@ -1381,6 +1485,8 @@ def run_session(
     execution_mask: Optional[BimanualActiveArmHoldMask] = None,
     *,
     seed_plan: Optional[RolloutSeedPlan] = None,
+    replan_settle_s: float = 0.0,
+    prefetch_lead_steps: int = 0,
     primary_config_path: Optional[str] = None,
     secondary_config_path: Optional[str] = None,
     process_seed_metadata: Optional[Dict[str, Any]] = None,
@@ -1492,6 +1598,8 @@ def run_session(
                 max_steps=max_steps,
                 live_view=live_view,
                 execution_mask=execution_mask,
+                replan_settle_s=float(replan_settle_s),
+                prefetch_lead_steps=int(prefetch_lead_steps),
             )
 
             saver.flush()
@@ -1594,7 +1702,7 @@ def _convert_if_any(
 
 
 def main() -> None:
-    global _rest_return_eligible
+    global _rest_return_eligible, _policy
 
     # Fallback only. The explicit ``finally`` below is the normal shutdown
     # path because Python waits for the robot's non-daemon server thread before
@@ -1673,13 +1781,63 @@ def main() -> None:
         control_hz=float(raw_left_cfg.get("hz", 30)),
     )
 
-    mode = eval_cfg.get("mode", "server")
+    mode = args.policy_mode or eval_cfg.get("mode", "server")
     if mode == "local":
         policy = MolmoActLocal(**(eval_cfg.get("local") or {}))
     elif mode == "server":
-        policy = MolmoAct(server=eval_cfg.get("molmoact_server"))
+        # Hosted policy: one official Servo action session for the whole run.
+        server_options = dict(eval_cfg.get("server") or {})
+        for cli_value, key in (
+            (args.servo_deployment, "deployment"),
+            (args.servo_credentials, "credentials"),
+            (args.servo_python, "servo_python"),
+        ):
+            if cli_value is not None:
+                server_options[key] = cli_value
+        if not server_options.get("deployment"):
+            raise SystemExit(
+                "server mode needs a managed Servo deployment id: pass "
+                "--servo-deployment or set eval.server.deployment"
+            )
+        policy = MolmoActServo(**server_options)
+    elif mode == "direct":
+        # Self-hosted `servo serve` endpoint: the grant is the entire identity.
+        # Deliberately no fallback endpoint and no control plane — a failure
+        # aborts the run instead of rerouting it somewhere unmeasured.
+        direct_options = dict(eval_cfg.get("direct") or {})
+        for cli_value, key in (
+            (args.servo_grant, "grant"),
+            (args.servo_python, "servo_python"),
+        ):
+            if cli_value is not None:
+                direct_options[key] = cli_value
+        if not direct_options.get("grant"):
+            raise SystemExit(
+                "direct mode needs a `servo serve` grant file: pass "
+                "--servo-grant or set eval.direct.grant"
+            )
+        policy = MolmoActServo(**direct_options)
+    elif mode == "http":
+        policy = MolmoActHTTP(
+            server=args.molmoact_server or eval_cfg.get("molmoact_server"),
+            **(eval_cfg.get("http") or {}),
+        )
     else:
-        raise SystemExit(f"eval.mode must be 'server' or 'local', got {mode!r}")
+        raise SystemExit(
+            f"eval.mode must be 'server' (managed Servo action session), 'direct' "
+            f"(self-hosted `servo serve` grant), 'http' "
+            f"(self-hosted host_server_yam.py), or 'local', got {mode!r}"
+        )
+    _policy = policy
+    if isinstance(policy, MolmoActServo):
+        # Open the action session before any motor can be enabled: a bad
+        # credential, deployment or lease must fail with the arms still cold.
+        identity = policy.open()
+        print(
+            f"[servo] action session {identity.get('session_id')} on "
+            f"{identity.get('deployment_id')} "
+            f"(generation {identity.get('generation_id')})"
+        )
 
     env, left_cfg, right_cfg, bimanual = _build_env(args)
 
@@ -1721,6 +1879,8 @@ def main() -> None:
             num_rollouts=args.num_rollouts,
             execution_mask=execution_mask,
             seed_plan=seed_plan,
+            replan_settle_s=float(args.replan_settle_s),
+            prefetch_lead_steps=int(args.prefetch_lead_steps),
             primary_config_path=args.config_path,
             secondary_config_path=args.right_config_path,
             process_seed_metadata=process_seed_metadata,

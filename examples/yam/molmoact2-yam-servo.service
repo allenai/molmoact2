@@ -1,0 +1,15 @@
+[Unit]
+Description=Servo MolmoAct2 BimanualYAM endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/molmoact2
+Environment=PYTHONPATH=%h/code/molmoact2/examples/yam:%h/code/servo/src
+ExecStart=%h/code/molmoact2/.venv/bin/python %h/code/molmoact2/examples/yam/host_servo_yam.py --verifier-config %h/.config/servo/molmoact2-yam-odin-verifier.json --host 127.0.0.1 --port 8202 --cuda-graph --metrics-host 172.17.0.1 --metrics-port 9464
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

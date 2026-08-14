@@ -7,6 +7,15 @@
 #   * lerobot (allenai molmoact2-policy branch) — only needed for the optional
 #     end-of-session dataset conversion:
 #       pip install "git+https://github.com/allenai/lerobot.git@molmoact2-policy"
+#
+# `server` mode (hosted policy over one official Servo action session) needs the
+# official `servo-client` SDK, which requires Python >= 3.12 and therefore does
+# NOT belong in this file's Python 3.11 robot runtime. Keep it in a separate
+# interpreter and point `--servo-python` / `SERVO_PYTHON` at that interpreter:
+#       /home/npow/code/servo/.venv/bin/python     # this workstation
+#       pip install servo-client                   # any other Python >= 3.12 env
+# `servo_session_bridge.py` runs there and speaks to the robot process over a
+# local pipe; nothing else about server mode is installed here.
 
 numpy
 torch
@@ -15,6 +24,7 @@ huggingface_hub
 hf_transfer
 json_numpy
 requests
+prometheus-client>=0.21
 opencv-python
 Pillow
 h5py
