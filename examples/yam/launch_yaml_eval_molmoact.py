@@ -493,6 +493,24 @@ class Args:
     servo_python: Optional[str] = None
     """Python >= 3.12 interpreter with servo-client, if this runtime lacks it."""
 
+    observation_encoding: Optional[Literal["jpeg", "h264"]] = None
+    """``direct`` mode only: the observation wire the action session negotiates.
+    ``jpeg`` (default) mints one JPEG per camera on this machine and is the
+    comparison arm; ``h264`` sends the same pixels and lets the session's own
+    transport encode them into a per-camera stateful stream -- measured ~21 KB
+    per act against ~88 KB on jpeg. Overrides eval.direct.observation_encoding."""
+
+    h264_crf: Optional[int] = None
+    """``--observation-encoding h264`` only: the encoder's rate point. Leave it
+    unset for the qualified default; the decoder is indifferent either way."""
+
+    exec_steps: Optional[int] = None
+    """Execute this many rows of each action chunk before replanning from a fresh
+    observation. The model publishes a 30-row horizon; running fewer rows shortens
+    the damage radius of one hot plan (15 rows = 0.5 s at 30 Hz instead of 1.0 s)
+    at the cost of one extra inference per chunk. Unset keeps today's behaviour --
+    the whole chunk. Overrides eval.exec_steps."""
+
     prefetch_lead_steps: int = 0
     """Fire the next inference this many control steps BEFORE the current chunk
     ends, from a fresh observation captured at that moment, and splice the reply
@@ -1213,6 +1231,89 @@ def refresh_robot_feedback_after_inference(
     return refreshed
 
 
+def resolve_exec_steps(
+    cli_value: Optional[int],
+    eval_cfg: Dict[str, Any],
+) -> Optional[int]:
+    """How many rows of each plan to execute, or ``None`` for the whole chunk.
+
+    A real config/CLI field rather than something inferred from a visualization
+    section: ``eval.rerun.action_chunk_size`` looks like this knob and is not --
+    it only ever reached the Rerun export watchdog, so a config that asked for
+    15 rows still executed all 30 and the hot-draw damage radius stayed at the
+    full 1.0 s the setting was meant to halve.
+    """
+    value = cli_value if cli_value is not None else (eval_cfg or {}).get("exec_steps")
+    if value is None:
+        return None
+    steps = int(value)
+    if steps <= 0:
+        raise SystemExit(f"exec_steps must be positive, got {steps}")
+    return steps
+
+
+def print_execution_bracket(
+    *,
+    exec_steps: Optional[int],
+    action_horizon: Optional[int],
+    control_hz: float,
+    identity: Dict[str, Any],
+    both_arm_max_delta: Any,
+) -> None:
+    """State the whole actuation bracket in one place, before the arms move.
+
+    Every number here has been silently wrong at least once in this project: a
+    chunk-size setting that never reached the executor, and grants whose
+    ``max_jump``/``max_relative_target`` are ``null`` -- i.e. no server-side
+    guard at all, with the per-tick delta clamp as the only actuation limit.
+    An operator must be able to read that off the terminal rather than infer it
+    from a YAML file and a grant blob.
+    """
+    horizon = int(action_horizon) if action_horizon else None
+    rows = exec_steps if exec_steps is not None else horizon
+    if rows is not None and horizon:
+        rows = min(rows, horizon)
+    span = f"{rows / control_hz:.2f}s" if rows and control_hz > 0 else "unknown"
+    print(
+        "[execution] executing "
+        + (f"{rows} of {horizon} rows" if rows and horizon else "the full chunk")
+        + f" per plan ({span} of motion at {control_hz:g} Hz)"
+        + ("" if exec_steps is not None else "  [default: whole chunk]")
+    )
+    profile = dict(identity.get("control_profile") or {})
+    jump = profile.get("max_jump")
+    relative = profile.get("max_relative_target")
+    print(
+        "[execution] server-side guard: "
+        f"max_jump={jump if jump is not None else 'NONE'}, "
+        f"max_relative_target={relative if relative is not None else 'NONE'}"
+    )
+    if identity and (jump is None or relative is None):
+        print(
+            "[execution] WARNING: this grant carries no server-side actuation guard; "
+            "the per-tick eval.bimanual.both_arm_max_delta clamp is the ONLY limit "
+            "on commanded motion"
+        )
+    if both_arm_max_delta is not None:
+        deltas = list(np.asarray(both_arm_max_delta).reshape(-1))
+        print(
+            f"[execution] per-tick clamp both_arm_max_delta: max={max(deltas):g} "
+            f"min={min(deltas):g} rad/tick over {len(deltas)} fields"
+        )
+    else:
+        print("[execution] per-tick clamp both_arm_max_delta: NONE")
+    if identity:
+        print(
+            "[execution] observation wire: "
+            f"{identity.get('observation_encoding') or 'jpeg'}"
+            + (
+                f" (crf {identity['h264_crf']})"
+                if identity.get("h264_crf") is not None
+                else ""
+            )
+        )
+
+
 def run_one_rollout(
     env: RobotEnv,
     policy: PolicyBase,
@@ -1225,6 +1326,7 @@ def run_one_rollout(
     execution_mask: Optional[BimanualActiveArmHoldMask] = None,
     replan_settle_s: float = 0.0,
     prefetch_lead_steps: int = 0,
+    exec_steps: Optional[int] = None,
 ) -> RolloutOutcome:
     """Execute one rollout and buffer per-step observations into ``saver``.
 
@@ -1264,6 +1366,10 @@ def run_one_rollout(
     prefetch_future: Optional[concurrent.futures.Future] = None
     prefetch_capture_step: Optional[int] = None
     chunk_start_row = 0
+    # The last row of the current plan this rollout will execute. ``exec_steps``
+    # caps it below the model's full horizon so one hot draw commands at most
+    # that many rows before a fresh observation replaces it.
+    chunk_rows_end = 0
     if prefetch_lead_steps > 0:
         prefetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
@@ -1275,10 +1381,10 @@ def run_one_rollout(
         # I2RT motor-control thread continuously holds the previous target
         # while inference runs, so this does not starve the motor watchdog.
         obs_pre = env.get_obs()
-        if action_chunk is None or chunk_index >= len(action_chunk):
+        if action_chunk is None or chunk_index >= chunk_rows_end:
             if action_chunk is not None and chunk_started_at is not None:
                 execution_sec = time.monotonic() - chunk_started_at
-                rows_run = len(action_chunk) - chunk_start_row
+                rows_run = chunk_rows_end - chunk_start_row
                 logger.info(
                     "Completed %d/%d action commands in %.3fs (%.2f Hz)",
                     rows_run,
@@ -1336,6 +1442,11 @@ def run_one_rollout(
             )
             chunk_index = splice_index
             chunk_start_row = splice_index
+            chunk_rows_end = (
+                len(action_chunk)
+                if exec_steps is None
+                else min(len(action_chunk), splice_index + int(exec_steps))
+            )
             policy_chunk_index += 1
             saver.add_policy_action_chunk(
                 start_step=step,
@@ -1352,9 +1463,12 @@ def run_one_rollout(
             obs_pre = refresh_robot_feedback_after_inference(env, obs_pre)
 
             logger.info(
-                "Fresh action plan at rollout step %d: %d absolute-pose actions",
+                "Fresh action plan at rollout step %d: %d absolute-pose actions "
+                "(executing rows %d..%d)",
                 step + 1,
                 len(action_chunk),
+                chunk_start_row,
+                chunk_rows_end - 1,
             )
             # The YAM checkpoint emits a normalized aperture: 0=closed,
             # 1=open. The robot-side mapper is solely responsible for mapping
@@ -1368,7 +1482,7 @@ def run_one_rollout(
                 current_gripper = float(
                     np.asarray(obs_pre["joint_positions"])[gripper_index]
                 )
-                gripper_targets = action_chunk[:, gripper_index]
+                gripper_targets = action_chunk[chunk_start_row:chunk_rows_end, gripper_index]
                 logger.info(
                     "Gripper targets (normalized aperture, %s arm%s): "
                     "current=%.4f, first=%.4f, last=%.4f, range=[%.4f, %.4f]",
@@ -1390,8 +1504,8 @@ def run_one_rollout(
             prefetch_pool is not None
             and prefetch_future is None
             and action_chunk is not None
-            and (len(action_chunk) - chunk_index)
-            <= min(max(1, prefetch_lead_steps), len(action_chunk) - 1)
+            and (chunk_rows_end - chunk_index)
+            <= min(max(1, prefetch_lead_steps), max(1, chunk_rows_end - chunk_start_row - 1))
         ):
             # Fresh observation captured NOW (main thread), inference overlapped
             # with the remainder of this chunk's execution. One in flight max.
@@ -1499,6 +1613,7 @@ def run_session(
     seed_plan: Optional[RolloutSeedPlan] = None,
     replan_settle_s: float = 0.0,
     prefetch_lead_steps: int = 0,
+    exec_steps: Optional[int] = None,
     primary_config_path: Optional[str] = None,
     secondary_config_path: Optional[str] = None,
     process_seed_metadata: Optional[Dict[str, Any]] = None,
@@ -1613,6 +1728,7 @@ def run_session(
                 execution_mask=execution_mask,
                 replan_settle_s=float(replan_settle_s),
                 prefetch_lead_steps=int(prefetch_lead_steps),
+                exec_steps=exec_steps,
             )
 
             saver.flush()
@@ -1822,6 +1938,8 @@ def main() -> None:
         for cli_value, key in (
             (args.servo_grant, "grant"),
             (args.servo_python, "servo_python"),
+            (args.observation_encoding, "observation_encoding"),
+            (args.h264_crf, "h264_crf"),
         ):
             if cli_value is not None:
                 direct_options[key] = cli_value
@@ -1843,15 +1961,30 @@ def main() -> None:
             f"(self-hosted host_server_yam.py), or 'local', got {mode!r}"
         )
     _policy = policy
+    identity: Dict[str, Any] = {}
     if isinstance(policy, MolmoActServo):
         # Open the action session before any motor can be enabled: a bad
         # credential, deployment or lease must fail with the arms still cold.
+        # ``ServoDirectHost.open`` forces the endpoint and session round trips
+        # to make that true -- ``DirectPolicy`` is otherwise lazy and would
+        # first touch the network on the first act, with the arms already live.
         identity = policy.open()
         print(
             f"[servo] action session {identity.get('session_id')} on "
             f"{identity.get('deployment_id')} "
-            f"(generation {identity.get('generation_id')})"
+            f"(generation {identity.get('generation_id')}, "
+            f"{identity.get('observation_encoding') or 'jpeg'} wire)"
         )
+    exec_steps = resolve_exec_steps(args.exec_steps, eval_cfg)
+    print_execution_bracket(
+        exec_steps=exec_steps,
+        action_horizon=(
+            policy.get_action_horizon() if hasattr(policy, "get_action_horizon") else None
+        ),
+        control_hz=float(raw_left_cfg.get("hz", 30)),
+        identity=identity,
+        both_arm_max_delta=bimanual_cfg.get("both_arm_max_delta"),
+    )
 
     env, left_cfg, right_cfg, bimanual = _build_env(args)
 
@@ -1895,6 +2028,7 @@ def main() -> None:
             seed_plan=seed_plan,
             replan_settle_s=float(args.replan_settle_s),
             prefetch_lead_steps=int(args.prefetch_lead_steps),
+            exec_steps=exec_steps,
             primary_config_path=args.config_path,
             secondary_config_path=args.right_config_path,
             process_seed_metadata=process_seed_metadata,
