@@ -39,6 +39,7 @@ MolmoAct2 is Ai2's open family of action reasoning models for robot control and 
 
 ---
 ### Updates
+- **[2026/08/21]** 🔥 For fine-tuning, please use this temporary repo for best effect, while we revise the HF LeRobot repo: [**hq-fang/lerobot**](https://github.com/hq-fang/lerobot/tree/main).
 - **[2026/06/13]** 🔥 We have released pre-training and post-training code and full experimental details for MolmoAct2, get started [**Here**](https://github.com/allenai/molmoact2/tree/main/experiments).
 - **[2026/06/10]** 🔥 We have setup zero-shot evaluation for MolmoAct2 (DROID and Bimanual YAM) on Maniskill simulation, get started [**Here**](https://github.com/allenai/molmoact2/tree/main/sim_eval).
 - **[2026/05/28]** 🔥 MolmoAct2 has been fully integrated into Huggingface, LeRobot official repo at [**MolmoAct2**](https://huggingface.co/docs/lerobot/main/en/molmoact2).
