@@ -47,17 +47,49 @@ def test_molmoact2_training_defaults_are_release_defaults():
 
 
 @pytest.mark.parametrize("action_format", ["both", "discrete"])
-def test_molmoact2_training_rejects_discrete_action_formats(action_format):
-    from launch_scripts.lerobot_utils.train_plan import _validate_continuous_action_training_args
+def test_molmoact2_training_allows_discrete_action_formats_up_to_32d(action_format):
+    from launch_scripts.lerobot_utils.train_plan import _validate_action_training_args
+
+    _validate_action_training_args(
+        action_format,
+        max_action_dim=32,
+        discrete_action_tokenizer="allenai/MolmoAct2-FAST-Tokenizer",
+    )
+
+
+@pytest.mark.parametrize("action_format", ["both", "discrete"])
+def test_molmoact2_training_rejects_discrete_action_formats_above_32d(action_format):
+    from launch_scripts.lerobot_utils.train_plan import _validate_action_training_args
 
     with pytest.raises(ValueError, match="action tokenizer is only trained with action dim max to 32"):
-        _validate_continuous_action_training_args(action_format)
+        _validate_action_training_args(
+            action_format,
+            max_action_dim=33,
+            discrete_action_tokenizer="allenai/MolmoAct2-FAST-Tokenizer",
+        )
 
 
-def test_molmoact2_training_allows_continuous_action_format():
-    from launch_scripts.lerobot_utils.train_plan import _validate_continuous_action_training_args
+@pytest.mark.parametrize("action_format", ["both", "discrete"])
+def test_molmoact2_training_requires_tokenizer_for_discrete_action_formats(action_format):
+    from launch_scripts.lerobot_utils.train_plan import _validate_action_training_args
 
-    _validate_continuous_action_training_args("continuous")
+    with pytest.raises(ValueError, match="requires --discrete_action_tokenizer"):
+        _validate_action_training_args(
+            action_format,
+            max_action_dim=14,
+            discrete_action_tokenizer=None,
+        )
+
+
+@pytest.mark.parametrize("max_action_dim", [14, 33, 64])
+def test_molmoact2_training_allows_continuous_action_format(max_action_dim):
+    from launch_scripts.lerobot_utils.train_plan import _validate_action_training_args
+
+    _validate_action_training_args(
+        "continuous",
+        max_action_dim=max_action_dim,
+        discrete_action_tokenizer=None,
+    )
 
 
 def test_action_expert_checkpoint_weights_resize_when_action_dim_exceeds_32():

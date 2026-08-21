@@ -32,7 +32,7 @@ from launch_scripts.lerobot_utils.train_plan import (
     _normalize_registered_lerobot_tag_metadata,
     _normalize_style_sampling_rates,
     _reject_removed_action_training_flags,
-    _validate_continuous_action_training_args,
+    _validate_action_training_args,
     _sync_vlm_data_cfg_with_primary,
     _validate_lerobot_tag_temporal_metadata,
     _validate_packed_action_chunk_padding_args,
@@ -303,8 +303,9 @@ def main():
     parser.add_argument(
         "--action_format",
         default="continuous",
+        choices=["continuous", "discrete", "both"],
         type=str,
-        help="LeRobot action supervision format. Training supports continuous only.",
+        help="LeRobot action supervision format: continuous, discrete, or both.",
     )
     parser.add_argument(
         "--state_format",
@@ -317,7 +318,7 @@ def main():
         "--discrete_action_tokenizer",
         default=None,
         type=str,
-        help=argparse.SUPPRESS,
+        help="Action tokenizer used by discrete and both action supervision.",
     )
     parser.add_argument("--img_resize", default=None, type=str)
     parser.add_argument("--crop_mode", default="resize", type=str)
@@ -425,8 +426,6 @@ def main():
     )
     _reject_removed_action_training_flags(argv_tokens)
     args, other_args = parser.parse_known_args()
-    _validate_continuous_action_training_args(args.action_format)
-    args.discrete_action_tokenizer = None
 
     explicit_max_action_dim = any(
         token == "--max_action_dim" or token.startswith("--max_action_dim=")
@@ -490,6 +489,11 @@ def main():
             int(args.max_action_dim),
             ACTION_TOKENIZER_MAX_ACTION_DIM,
         )
+    _validate_action_training_args(
+        args.action_format,
+        max_action_dim=int(args.max_action_dim),
+        discrete_action_tokenizer=args.discrete_action_tokenizer,
+    )
     _validate_lerobot_tag_temporal_metadata(
         training_data_plan.robot_mixture,
         tag_metadata_by_tag=TAG_METADATA_BY_TAG,
@@ -618,6 +622,12 @@ def main():
             raise ValueError(
                 "--state_format in {discrete,both} requires added state tokens "
                 "(<state_start>, <state_end>, and at least one <state_i>) in the tokenizer."
+            )
+    if args.action_format in {"discrete", "both"}:
+        if target_discrete_action_bins <= 0 or not has_action_boundaries:
+            raise ValueError(
+                "--action_format in {discrete,both} requires added action tokens "
+                "(<action_start>, <action_end>, and at least one <action_i>) in the tokenizer."
             )
     if args.add_depth_tokens:
         if target_depth_bins <= 0 or not has_depth_boundaries:

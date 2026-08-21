@@ -25,6 +25,7 @@ from olmo.hf_model.modeling_molmoact2 import (
     _build_discrete_state_string,
     _build_robot_text,
     _normalize_question_text,
+    _select_constrained_discrete_action_token,
 )
 
 
@@ -253,6 +254,56 @@ def test_hf_predict_action_drops_trivial_attention_mask():
 
     assert "attention_mask" not in out
     assert "attention_mask" in inputs
+
+
+def test_constrained_fast_generation_enforces_exact_decoded_shape():
+    class BpeTokenizer:
+        expansions = {0: "a", 1: "bb", 2: "c"}
+
+        def decode(self, token_ids):
+            return "".join(self.expansions[int(token_id)] for token_id in token_ids)
+
+    action_tokenizer = SimpleNamespace(bpe_tokenizer=BpeTokenizer())
+    logits = torch.full((1, 32), -10.0)
+    logits[0, 21] = 20.0  # The model prefers ending one coefficient early.
+    logits[0, 24] = 10.0
+    token_map = {22: 0, 23: 1, 24: 2}
+
+    selected = _select_constrained_discrete_action_token(
+        logits,
+        [20, 22, 23],
+        action_tokenizer=action_tokenizer,
+        action_start_token_id=20,
+        action_end_token_id=21,
+        eos_token_id=2,
+        action_token_id_to_bin=token_map,
+        target_coefficients=4,
+    )
+    assert selected.tolist() == [24]
+
+    selected = _select_constrained_discrete_action_token(
+        logits,
+        [20, 22, 23, 24],
+        action_tokenizer=action_tokenizer,
+        action_start_token_id=20,
+        action_end_token_id=21,
+        eos_token_id=2,
+        action_token_id_to_bin=token_map,
+        target_coefficients=4,
+    )
+    assert selected.tolist() == [21]
+
+    selected = _select_constrained_discrete_action_token(
+        logits,
+        [20, 22, 23, 24, 21],
+        action_tokenizer=action_tokenizer,
+        action_start_token_id=20,
+        action_end_token_id=21,
+        eos_token_id=2,
+        action_token_id_to_bin=token_map,
+        target_coefficients=4,
+    )
+    assert selected.tolist() == [2]
 
 
 def test_converter_release_validation_rejects_unsupported_modes():

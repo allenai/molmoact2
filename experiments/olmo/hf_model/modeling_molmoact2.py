@@ -1389,6 +1389,110 @@ def _extract_discrete_token_bins(
     ]
 
 
+def _decode_discrete_action_serialized_text(
+    action_tokenizer: Any,
+    token_bins: Sequence[int],
+) -> str:
+    bpe_tokenizer = getattr(action_tokenizer, "bpe_tokenizer", None)
+    if bpe_tokenizer is None:
+        bpe_tokenizer = getattr(action_tokenizer, "tokenizer", None)
+    if bpe_tokenizer is None or not callable(getattr(bpe_tokenizer, "decode", None)):
+        raise TypeError(
+            "Discrete action tokenizer must expose bpe_tokenizer.decode() or tokenizer.decode()."
+        )
+    try:
+        return str(bpe_tokenizer.decode(list(token_bins)))
+    except TypeError:
+        return str(
+            bpe_tokenizer.decode(
+                list(token_bins),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+
+
+def _select_constrained_discrete_action_token(
+    logits: torch.Tensor,
+    generated_ids: Sequence[int],
+    *,
+    action_tokenizer: Any,
+    action_start_token_id: int,
+    action_end_token_id: int,
+    eos_token_id: int,
+    action_token_id_to_bin: Mapping[int, int],
+    target_coefficients: int,
+) -> torch.Tensor:
+    """Select the best token that preserves a fixed-size FAST action span."""
+    if logits.ndim != 2 or int(logits.shape[0]) != 1:
+        raise ValueError(
+            "Constrained discrete action generation currently requires batch size 1, "
+            f"got logits shape {tuple(logits.shape)}."
+        )
+    if int(target_coefficients) < 1:
+        raise ValueError(
+            f"target_coefficients must be positive, got {int(target_coefficients)}."
+        )
+
+    ids = [int(token_id) for token_id in generated_ids]
+    try:
+        start_idx = ids.index(int(action_start_token_id))
+    except ValueError:
+        return torch.full(
+            (1,), int(action_start_token_id), dtype=torch.long, device=logits.device
+        )
+
+    span_ids = ids[start_idx + 1 :]
+    if int(action_end_token_id) in span_ids:
+        return torch.full(
+            (1,), int(eos_token_id), dtype=torch.long, device=logits.device
+        )
+
+    token_bins = [
+        int(action_token_id_to_bin[token_id])
+        for token_id in span_ids
+        if token_id in action_token_id_to_bin
+    ]
+    decoded_length = len(
+        _decode_discrete_action_serialized_text(action_tokenizer, token_bins)
+    )
+    if decoded_length > int(target_coefficients):
+        raise RuntimeError(
+            "Constrained FAST generation exceeded its target coefficient count: "
+            f"{decoded_length} > {int(target_coefficients)}."
+        )
+    if decoded_length == int(target_coefficients):
+        return torch.full(
+            (1,), int(action_end_token_id), dtype=torch.long, device=logits.device
+        )
+
+    candidate_ids = sorted(int(token_id) for token_id in action_token_id_to_bin)
+    if not candidate_ids:
+        raise RuntimeError("Constrained FAST generation has no indexed action tokens.")
+    candidate_tensor = torch.tensor(candidate_ids, dtype=torch.long, device=logits.device)
+    candidate_order = torch.argsort(
+        logits[0].index_select(0, candidate_tensor),
+        descending=True,
+    )
+    for candidate_offset in candidate_order.detach().cpu().tolist():
+        candidate_id = candidate_ids[int(candidate_offset)]
+        candidate_bin = int(action_token_id_to_bin[candidate_id])
+        candidate_length = len(
+            _decode_discrete_action_serialized_text(
+                action_tokenizer,
+                [*token_bins, candidate_bin],
+            )
+        )
+        if decoded_length < candidate_length <= int(target_coefficients):
+            return torch.full(
+                (1,), candidate_id, dtype=torch.long, device=logits.device
+            )
+    raise RuntimeError(
+        "No action BPE token can advance constrained FAST generation without "
+        f"overshooting {int(target_coefficients)} coefficients from {decoded_length}."
+    )
+
+
 @dataclass
 class MolmoAct2ActionOutput(ModelOutput):
     actions: Optional[torch.FloatTensor] = None
@@ -4187,6 +4291,9 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
         end_token_id: int,
         max_steps: int,
         attention_bias: Optional[torch.Tensor] = None,
+        action_tokenizer: Any = None,
+        action_dim: Optional[int] = None,
+        action_horizon: Optional[int] = None,
     ) -> torch.Tensor:
         generated_tokens: List[torch.Tensor] = []
         current_output = initial_output
@@ -4194,7 +4301,27 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
         current_attention_mask = attention_mask
         hit_end = False
         for _ in range(int(max_steps)):
-            next_token = torch.argmax(current_output.logits[:, -1, :], dim=-1)
+            if action_tokenizer is None:
+                next_token = torch.argmax(current_output.logits[:, -1, :], dim=-1)
+            else:
+                if action_dim is None or action_horizon is None:
+                    raise ValueError(
+                        "Constrained discrete action generation requires action_dim "
+                        "and action_horizon."
+                    )
+                next_token = _select_constrained_discrete_action_token(
+                    current_output.logits[:, -1, :],
+                    [
+                        int(token.reshape(-1)[0].item())
+                        for token in generated_tokens
+                    ],
+                    action_tokenizer=action_tokenizer,
+                    action_start_token_id=int(self.config.action_start_token_id),
+                    action_end_token_id=int(self.config.action_end_token_id),
+                    eos_token_id=int(end_token_id),
+                    action_token_id_to_bin=self._action_token_id_to_bin(),
+                    target_coefficients=int(action_dim) * int(action_horizon),
+                )
             generated_tokens.append(next_token)
             if bool((next_token == int(end_token_id)).all()):
                 hit_end = True
@@ -4640,6 +4767,9 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
                     attention_mask=depth_prefix.attention_mask,
                     end_token_id=self._require_eos_token_id(),
                     max_steps=max(1, int(generation_horizon * 16)),
+                    action_tokenizer=action_tokenizer,
+                    action_dim=action_dim,
+                    action_horizon=generation_horizon,
                 )
                 generated_token_ids = torch.cat(
                     [depth_prefix.token_ids, action_token_ids], dim=1
@@ -4680,6 +4810,9 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
                     end_token_id=self._require_eos_token_id(),
                     max_steps=max_action_decode_steps,
                     attention_bias=action_attention_bias,
+                    action_tokenizer=action_tokenizer,
+                    action_dim=action_dim,
+                    action_horizon=generation_horizon,
                 )
                 generated_token_ids = action_token_ids
             actions = self._decode_discrete_action_chunk(

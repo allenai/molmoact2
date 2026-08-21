@@ -1482,6 +1482,16 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 handles.n_obs_steps,
                 resolved_n_action_steps,
             )
+            resolved_action_dim = self._resolve_action_dim_for_tag(
+                handles,
+                resolved_norm_tag,
+            )
+            result.actions = _slice_action_dim(result.actions, resolved_action_dim)
+            if handles.robot_processor is not None:
+                result.actions = handles.robot_processor.unnormalize_action(
+                    result.actions,
+                    repo_id=resolved_norm_tag,
+                )
         return result
 
     def generate_action_chunk_from_observations(
@@ -1605,9 +1615,20 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     result.generated_token_ids,
                     style=style,
                 )
+                action_chunk = result.actions
+                resolved_action_dim = self._resolve_action_dim_for_tag(
+                    handles,
+                    requested_norm_tag,
+                )
+                action_chunk = _slice_action_dim(action_chunk, resolved_action_dim)
+                if handles.robot_processor is not None:
+                    action_chunk = handles.robot_processor.unnormalize_action(
+                        action_chunk,
+                        repo_id=requested_norm_tag,
+                    )
                 self._enqueue_action_chunk(
                     action_queue,
-                    result.actions,
+                    action_chunk,
                     handles,
                     norm_tag=requested_norm_tag,
                     n_action_steps=requested_n_action_steps,
@@ -1633,10 +1654,6 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     f"norm_tag={requested_norm_tag!r}, resolved_tag={resolved_tag!r}, "
                     f"tag action_dim={int(expected_action_dim)}."
                 )
-            action_tensor = handles.robot_processor.unnormalize_action(
-                action_tensor,
-                repo_id=requested_norm_tag,
-            )
         if action_tensor.ndim == 1:
             action_tensor = action_tensor.unsqueeze(0)
         return action_tensor.to(handles.device)

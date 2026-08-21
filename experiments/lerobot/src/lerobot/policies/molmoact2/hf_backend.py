@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
+import json
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -9,12 +12,91 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
 from torch import Tensor
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, PreTrainedTokenizerFast
 
 from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_discrete_action_processor_path(
+    processor_name_or_path: str,
+    *,
+    local_files_only: bool,
+    hf_token: Optional[str] = None,
+) -> Path:
+    processor_path = Path(processor_name_or_path).expanduser()
+    if processor_path.exists():
+        return processor_path
+    return Path(
+        snapshot_download(
+            processor_name_or_path,
+            local_files_only=local_files_only,
+            token=hf_token,
+        )
+    )
+
+
+def _load_discrete_action_processor_from_path(
+    processor_path: Path,
+    *,
+    hf_token: Optional[str] = None,
+) -> Any:
+    """Load a custom FAST processor without requiring a model config.json."""
+    processor_config_path = processor_path / "processor_config.json"
+    if not processor_config_path.is_file():
+        raise FileNotFoundError(f"Missing processor_config.json at {processor_config_path}")
+
+    processor_config = json.loads(processor_config_path.read_text(encoding="utf-8"))
+    auto_processor_ref = (processor_config.get("auto_map") or {}).get("AutoProcessor")
+    if not isinstance(auto_processor_ref, str) or "." not in auto_processor_ref:
+        raise ValueError(
+            f"Processor config at {processor_config_path} does not define a loadable AutoProcessor entry."
+        )
+
+    module_name, class_name = auto_processor_ref.rsplit(".", 1)
+    module_path = processor_path / f"{module_name}.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Missing processor module {module_path}")
+
+    spec = importlib.util.spec_from_file_location(
+        f"cached_hf_action_processor_{hash(str(module_path.resolve()))}",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to import action processor module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    processor_cls = getattr(module, class_name)
+
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(
+        str(processor_path),
+        local_files_only=True,
+        token=hf_token,
+    )
+    processor_kwargs = {
+        key: value
+        for key, value in processor_config.items()
+        if key not in {"auto_map", "processor_class"}
+    }
+    return processor_cls(tokenizer, **processor_kwargs)
+
+
+def _load_discrete_action_processor(processor_name_or_path: str) -> Any:
+    offline_mode = (
+        os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"}
+        or os.environ.get("TRANSFORMERS_OFFLINE", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    hf_token = os.environ.get("HF_ACCESS_TOKEN")
+    processor_path = _resolve_discrete_action_processor_path(
+        processor_name_or_path,
+        local_files_only=offline_mode,
+        hf_token=hf_token,
+    )
+    return _load_discrete_action_processor_from_path(processor_path, hf_token=hf_token)
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -229,10 +311,7 @@ class MolmoAct2HFBackend:
                     "MolmoAct2HFPolicy with inference_action_mode='discrete' requires "
                     "`discrete_action_tokenizer` to be provided."
                 )
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                trust_remote_code=True,
-            )
+            self.action_tokenizer = _load_discrete_action_processor(tokenizer_name)
 
     def reset(self) -> None:
         self._action_queues = defaultdict(lambda: deque())

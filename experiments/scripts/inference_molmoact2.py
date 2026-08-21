@@ -126,11 +126,7 @@ def _maybe_normalize_state(model_cfg, state: np.ndarray, repo_id: Optional[str])
     if proc_cfg is None:
         return state
     pre = proc_cfg.build_preprocessor()
-    try:
-        return pre.normalize_state(state, repo_id)
-    except Exception as exc:
-        log.warning("State normalization failed, using raw state: %s", exc)
-        return state
+    return pre.normalize_state(state, repo_id)
 
 
 def _maybe_unnormalize_action(model_cfg, actions: np.ndarray, repo_id: Optional[str]) -> np.ndarray:
@@ -138,11 +134,7 @@ def _maybe_unnormalize_action(model_cfg, actions: np.ndarray, repo_id: Optional[
     if proc_cfg is None:
         return actions
     post = proc_cfg.build_postprocessor()
-    try:
-        return post.unnormalize_action(actions, repo_id)
-    except Exception as exc:
-        log.warning("Action unnormalization failed, returning normalized actions: %s", exc)
-        return actions
+    return post.unnormalize_action(actions, repo_id)
 
 
 def main():

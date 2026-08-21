@@ -181,13 +181,27 @@ def _validate_packed_action_chunk_padding_args(args) -> None:
         )
 
 
-def _validate_continuous_action_training_args(action_format: str) -> None:
+def _validate_action_training_args(
+    action_format: str,
+    *,
+    max_action_dim: int,
+    discrete_action_tokenizer: Optional[str],
+) -> None:
     normalized = str(action_format).strip().lower()
-    if normalized != "continuous":
+    if normalized not in {"continuous", "discrete", "both"}:
         raise ValueError(
-            "MolmoAct2 training only supports --action_format=continuous. "
+            f"Unsupported --action_format={action_format!r}. "
+            "Expected one of: continuous, discrete, both."
+        )
+    if normalized in {"discrete", "both"} and not str(discrete_action_tokenizer or "").strip():
+        raise ValueError(
+            f"--action_format={normalized} requires --discrete_action_tokenizer."
+        )
+    if normalized in {"discrete", "both"} and int(max_action_dim) > ACTION_TOKENIZER_MAX_ACTION_DIM:
+        raise ValueError(
             "The action tokenizer is only trained with action dim max to 32; "
-            "--action_format=both and --action_format=discrete are not supported."
+            f"--action_format={normalized} is not supported when max_action_dim={int(max_action_dim)}. "
+            "Use --action_format=continuous."
         )
 
 
