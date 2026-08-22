@@ -51,6 +51,7 @@ from .hil_processor import (
     TimeLimitProcessorStep,
 )
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
+from .relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
     ActionProcessorStep,

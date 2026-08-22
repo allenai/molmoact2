@@ -26,6 +26,8 @@ from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
+from .factory import get_policy_class as get_policy_class, make_pre_post_processors as make_pre_post_processors
+
 __all__ = [
     "ACTConfig",
     "DiffusionConfig",
@@ -40,4 +42,6 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
+    "get_policy_class",
+    "make_pre_post_processors",
 ]

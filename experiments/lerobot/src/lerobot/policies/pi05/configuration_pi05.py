@@ -33,6 +33,13 @@ class PI05Config(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
+    # Optional metadata fields in checkpoint configs
+    type: str | None = None
+    pretrained_revision: str | None = None
+    use_relative_actions: bool | None = None
+    relative_exclude_joints: list[str] | None = None
+    action_feature_names: list[str] | None = None
+
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
