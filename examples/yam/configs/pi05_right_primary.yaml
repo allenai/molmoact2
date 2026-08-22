@@ -1,0 +1,65 @@
+# Right arm configuration for pi0.5 (pi05-molmoact-yam) rollout.
+model_arm_side: right
+
+sensors:
+  cameras:
+    left_camera:
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_right
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 3000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "pi05_red_lid_right_arm"
+  language_instruction: "Using the right arm, pick up the red lid, place it fully on top of the black box, open the gripper to release it, then move the arm away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "pi05_right_arm"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  mode: direct
+  direct: {}
+  local:
+    repo_id: "helen9975/pi05-molmoact-yam"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: false
+    warmup: true
+  camera_server:
+    enabled: false

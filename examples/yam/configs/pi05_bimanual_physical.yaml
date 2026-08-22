@@ -1,0 +1,83 @@
+# Primary configuration for a native pi0.5 (pi05-molmoact-yam) rollout.
+#
+# State/action field order is fixed by the checkpoint:
+#   0:7   physical left arm / can_left
+#   7:14  physical right arm / can_right
+#
+# Dual-arm motion requires explicit CLI opt-in or setting active_arm_side.
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (model ``left_cam``)
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      # D435 serial 250423122040 (model ``top_cam``)
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      # D405 serial 402323071794 (model ``right_cam``)
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 5000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "pi05_red_lid_bimanual"
+  language_instruction: "Using both arms, coordinate to pick up the red lid, place it fully on top of the black box, release it, then move both arms away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "pi05_bimanual_yam"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  bimanual:
+    active_arm_side: both
+    execution_mode: shadow
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
+  live_view_enabled: false
+  return_to_rest_on_exit: true
+  return_to_rest_max_joint_step: 0.01
+  reproducibility:
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 15
+  mode: direct
+  direct: {}
+  local:
+    repo_id: "helen9975/pi05-molmoact-yam"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    enable_cuda_graph: true
+    warmup: true
+  camera_server:
+    enabled: false
