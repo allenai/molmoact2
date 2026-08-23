@@ -145,11 +145,13 @@ torchrun \
   launch_scripts/train_lerobot.py \
   allenai/MolmoAct2 \
   my_robot \
-  --seq_len=2100 \
-  --packing=true \
+  --packing=false \
+  --dynamic_seq_len=true \
   --ft_vlm=true \
   --ft_action_expert=true
 ```
 
 See the parent `README.md` for registering new mixtures and for full fine-tuning,
-LoRA fine-tuning, and action-expert-only fine-tuning commands.
+LoRA fine-tuning, action-expert-only fine-tuning, packing guidance, and LoRA
+checkpoint layout. Released-run reproduction may use packing, but it is not
+required for custom-data fine-tuning.

@@ -205,7 +205,7 @@ class Policy:
                 task=instruction,
                 state=state_f32,
                 norm_tag=NORM_TAG,
-                action_mode="continuous",
+                inference_action_mode="continuous",
                 enable_depth_reasoning=False,
                 num_steps=num_steps,
                 normalize_language=True,

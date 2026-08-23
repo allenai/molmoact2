@@ -2,6 +2,7 @@
 """CLI tool to download datasets training/eval data"""
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List
@@ -24,17 +25,9 @@ def _flatten_dataset_names(names: List) -> List[str]:
 
 
 def _download_dataset_by_name(name: str, n_procs: int) -> None:
-    from olmo.data.get_dataset import get_dataset_by_name
+    from olmo.data.get_dataset import download_dataset_by_name
 
-    errors = []
-    for split in ("train", "validation", "test"):
-        try:
-            dataset = get_dataset_by_name(name, split)
-            dataset.__class__.download(n_procs=n_procs)
-            return
-        except (AssertionError, NotImplementedError, KeyError, ValueError) as exc:
-            errors.append(f"{split}: {exc}")
-    raise ValueError(f"No downloadable dataset found for {name}. Tried {', '.join(errors)}")
+    download_dataset_by_name(name, n_procs=n_procs)
 
 
 def download_datasets(datasets: List[str], n_procs: int = 8):
@@ -164,6 +157,11 @@ Examples:
     )
 
     args = parser.parse_args()
+    if not os.environ.get("MOLMO_DATA_DIR"):
+        parser.error("MOLMO_DATA_DIR must be set before downloading datasets")
+    if args.n_procs < 1:
+        parser.error("--n-procs must be at least 1")
+
     datasets_to_download = {}  # dictionary to preserve insertion order
     for name in args.datasets:
         if name == "all":

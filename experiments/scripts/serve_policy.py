@@ -612,9 +612,8 @@ class MolmoAct2Server:
                 if result.actions is None:
                     response_payload["error"] = f"Style '{result.style}' does not produce actions."
                     return JSONResponse(response_payload, status_code=500)
+                # Public policy APIs return actions in raw environment space.
                 action_chunk = result.actions
-                if self.robot_processor is not None:
-                    action_chunk = self.robot_processor.unnormalize_action(action_chunk, repo_id=tag)
                 actions_np = action_chunk.detach().cpu().numpy()
                 response_payload["actions"] = actions_np[0].tolist() if actions_np.ndim >= 3 else actions_np.tolist()
                 response_payload["action_shape"] = list(actions_np.shape)
@@ -665,9 +664,8 @@ class MolmoAct2Server:
                 "style": result.style,
             }
             if result.actions is not None:
+                # Public policy APIs return actions in raw environment space.
                 action_chunk = result.actions
-                if self.robot_processor is not None:
-                    action_chunk = self.robot_processor.unnormalize_action(action_chunk, repo_id=tag)
                 actions_np = action_chunk.detach().cpu().numpy()
                 response_payload["actions"] = actions_np[0].tolist()
                 response_payload["action_shape"] = list(actions_np.shape)

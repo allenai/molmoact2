@@ -1,4 +1,7 @@
+import inspect
+import itertools
 import os
+import re
 
 from olmo.data.academic_datasets import (
     OkVqa,
@@ -54,7 +57,7 @@ from olmo.data.pixmo_datasets import (
     PixMoDocs, PixMoCount, PixMoPoints, PixMoCapQa, PixMoCap, PixMoPointExplanations,
     PixMoAskModelAnything, PixMoPointsEval, DenseCaptionEval, PixMoClocks,
     CoSyn, CoSynPoint, CorrectionQa, PixMoMultiImageCapQa, PixMoMultiImageMMRCapQa,
-    PixMoMultiPoints, CoSynMultiDocs,
+    PixMoMultiImageQa, PixMoMultiPoints, CoSynMultiDocs,
     SyntheticGround, GroundCUA
 )
 from olmo.data.spatial_datasets import (
@@ -62,9 +65,6 @@ from olmo.data.spatial_datasets import (
     CLEVR, Rel3D, GRiD3D, MindCube
 )
 from olmo.registry import registry
-import itertools
-import os
-import re
 
 
 def get_dataset_by_name(dataset_name, split) -> Dataset:
@@ -1076,6 +1076,10 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
         return PixMoPointsEval()
 
     # Multi-image Qa
+    if dataset_name == "pixmo_multi_image_qa":
+        return PixMoMultiImageQa(split=split)
+    elif dataset_name == "pixmo_multi_image_qa_multi_only_max5":
+        return PixMoMultiImageQa(split=split, multi_image_only=True, max_images=5)
     if dataset_name == "correction_qa":
         return CorrectionQa(split=split)
     elif dataset_name == "correction_qa_multi_only":
@@ -1422,3 +1426,58 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
         return MindCube(split=split, sample=int(dataset_name.split("_")[-1]))
 
     raise NotImplementedError(dataset_name, split)
+
+
+_MISSING_INIT = object()
+
+
+def get_all_dataset_classes():
+    """Return dataset classes imported into this module."""
+    return [
+        value
+        for value in globals().values()
+        if inspect.isclass(value) and issubclass(value, Dataset)
+    ]
+
+
+def get_dataset_class_by_name(dataset_name: str):
+    """Resolve a configured dataset name without initializing local data.
+
+    ``get_dataset_by_name`` is also the canonical mapping from mixture aliases to
+    concrete classes, but most dataset constructors immediately read their local
+    processed copy. Temporarily replacing constructors lets the download CLI use
+    that mapping and call the class-level ``download`` method first.
+    """
+    if dataset_name in {
+        "lvbench",
+        "mmiu",
+        "point_bench",
+        "real_world_qa_no_instruction",
+        "pixmo_point_eval2",
+    }:
+        split = "test"
+    elif dataset_name == "countbench_qa":
+        split = "huggingface"
+    else:
+        split = "train"
+
+    dataset_classes = get_all_dataset_classes()
+    original_initializers = {
+        cls: cls.__dict__.get("__init__", _MISSING_INIT) for cls in dataset_classes
+    }
+    try:
+        for cls in dataset_classes:
+            cls.__init__ = lambda *args, **kwargs: None
+        return type(get_dataset_by_name(dataset_name, split))
+    finally:
+        for cls, initializer in original_initializers.items():
+            if initializer is _MISSING_INIT:
+                del cls.__init__
+            else:
+                cls.__init__ = initializer
+
+
+def download_dataset_by_name(dataset_name: str, n_procs: int = 8) -> None:
+    """Download a configured dataset without requiring a pre-existing local copy."""
+    dataset_class = get_dataset_class_by_name(dataset_name)
+    dataset_class.download(n_procs=n_procs)

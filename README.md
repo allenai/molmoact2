@@ -39,7 +39,7 @@ MolmoAct2 is Ai2's open family of action reasoning models for robot control and 
 
 ---
 ### Updates
-- **[2026/08/21]** 🔥 For fine-tuning, please use this temporary repo for best effect, while we revise the HF LeRobot repo: [**hq-fang/lerobot**](https://github.com/hq-fang/lerobot/tree/main).
+- **[2026/08/22]** 🔥 We fixed some finetuning issues in LeRobot's MolmoAct2 training scripts: [**huggingface/lerobot**](https://github.com/huggingface/lerobot).
 - **[2026/06/13]** 🔥 We have released pre-training and post-training code and full experimental details for MolmoAct2, get started [**Here**](https://github.com/allenai/molmoact2/tree/main/experiments).
 - **[2026/06/10]** 🔥 We have setup zero-shot evaluation for MolmoAct2 (DROID and Bimanual YAM) on Maniskill simulation, get started [**Here**](https://github.com/allenai/molmoact2/tree/main/sim_eval).
 - **[2026/05/28]** 🔥 MolmoAct2 has been fully integrated into Huggingface, LeRobot official repo at [**MolmoAct2**](https://huggingface.co/docs/lerobot/main/en/molmoact2).
@@ -156,15 +156,19 @@ uv --version
 
 ### 2. Create the project environment
 
-The pinned dependencies (CUDA-12.1 PyTorch wheels, `transformers`, `fastapi`, `json-numpy`, …) live in `pyproject.toml`. From the repo root:
+The pinned dependencies (CUDA-12.8 PyTorch wheels, `transformers`, `fastapi`, `json-numpy`, …) live in `pyproject.toml`. CUDA 12.8 supports Blackwell GPUs, including RTX 50-series cards; it requires NVIDIA driver 570.26 or newer on Linux and 570.65 or newer on Windows. The CUDA toolkit itself does not need to be installed separately because the PyTorch wheels include the CUDA runtime.
+
+From the repo root:
 
 ```bash
 uv sync                  # creates .venv/ and installs all deps
-uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# expected: True NVIDIA RTX A6000
+uv run python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), torch.cuda.get_arch_list())"
+# expected: torch 2.11.0+cu128, torchvision 0.26.0+cu128, CUDA 12.8, and your GPU
 ```
 
-`uv` reads `.python-version` (3.11) and downloads a matching interpreter if needed. Re-run `uv sync` after pulling new commits.
+The project supports Python 3.11 and 3.12; `uv` selects a compatible interpreter and downloads one if needed. Re-run `uv sync` after pulling new commits.
+
+For an RTX 50-series GPU, confirm that the final architecture list contains `sm_120`. If inference fails with `no kernel image is available for execution on the device`, the environment is still using an older PyTorch wheel; run `uv sync --reinstall-package torch --reinstall-package torchvision` from the repository root and repeat the version check above.
 
 ### 3. Download the checkpoint (~22 GB each)
 

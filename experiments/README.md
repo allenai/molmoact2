@@ -36,6 +36,50 @@ export HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 ```
 
+## Downloading VLM Data
+
+The VLM data pipeline uses both the Hugging Face cache and processed datasets under
+`MOLMO_DATA_DIR`. Set both locations before running the downloader:
+
+```bash
+export MOLMO_DATA_DIR=/path/to/molmo/data
+export HF_HOME=/path/to/molmo/data/huggingface
+mkdir -p "${MOLMO_DATA_DIR}" "${HF_HOME}"
+```
+
+From the `experiments` directory, download one dataset, several datasets, or a built-in group:
+
+```bash
+python scripts/download_datasets.py pixmo_points_train --n-procs 8
+python scripts/download_datasets.py pixmo_points_train cosyn_point --n-procs 8
+python scripts/download_datasets.py pixmo
+python scripts/download_datasets.py image_pointing
+python scripts/download_datasets.py demo
+```
+
+`all` downloads the union of the built-in `pixmo`, `image_pointing`, `video_pointing`,
+`video_tracking`, and `demo` groups. Duplicate entries are downloaded only once, and the
+command reports every failed dataset before exiting nonzero:
+
+```bash
+python scripts/download_datasets.py all --n-procs 8
+```
+
+Public image data uses the same released sources as Molmo2. In particular,
+`cosyn_point`, `pixmo_multi_points`, and `pixmo_multi_image_qa` are loaded from
+`allenai/CoSyn-point`, `allenai/molmo2-pixmo-multi-points`, and
+`allenai/Molmo2-MultiImageQA`. They do not require private metadata JSON files.
+
+Processed image datasets are written below `${MOLMO_DATA_DIR}/torch_datasets`, shared
+PixMo images below `${MOLMO_DATA_DIR}/torch_datasets/pixmo_images`, and Hugging Face
+artifacts below `${HF_HOME}`. Downloads can be resumed safely because existing completed
+datasets and image files are reused.
+
+Some video and tracking datasets still require accepting a Hugging Face agreement or a
+manual download because of their upstream licenses. Those datasets are not replaced by
+the public PixMo download path; follow the error from the corresponding class in
+`olmo/data/video_datasets.py` or `olmo/data/video_object_tracking_datasets.py`.
+
 ## Checkpoints
 
 `launch_scripts/train_lerobot.py` accepts local checkpoint paths, URLs, and Hugging Face model IDs.
@@ -121,6 +165,14 @@ MOLMOACT2_LEROBOT_MIXTURES["my_robot"] = build_molmoact2_my_robot
 
 Use the same `tag` only for datasets that share robot semantics, action/state normalization, camera conventions, `setup_type`, and `control_mode`.
 
+### Packing And Training Budget
+
+For custom-data fine-tuning, start with `--packing=false --dynamic_seq_len=true`, as in the recipes below. Packing is not required for fine-tuning, and the unpacked setup makes `global_batch_size` and `max_duration` straightforward to interpret: each batch entry is one dataset sample.
+
+The release-reproduction recipes later in this document keep `--packing=true` because packing was part of those original training setups. With packing enabled, one fixed-length packed sequence can contain multiple source samples and action chunks, so a global batch size of 64 means 64 packed sequences per optimizer step, not necessarily 64 source samples. Packed and unpacked runs therefore should not be compared only by batch size and step count; also compare consumed samples, tokens, and action chunks. The trainer reports packing statistics such as `batch/n_packed` and `batch/packed_action_chunks_mean_actual` for this purpose.
+
+`--packing=true` and `--dynamic_seq_len=true` are mutually exclusive. Only enable packing for release reproduction or after profiling it as a deliberate throughput optimization for a custom workload.
+
 ### Smoke Test
 
 For a quick single-dataset validation, disable packing and use dynamic sequence lengths:
@@ -182,7 +234,7 @@ HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}" WANDB_API_KEY="${WANDB_API_KEY:-}" torchr
 
 ### LoRA Fine-Tuning
 
-LoRA fine-tuning updates LoRA adapters on the VLM path and fully trains the action expert. Use it for smaller datasets or similar embodiments.
+LoRA fine-tuning injects adapters only into linear layers in the VLM's LLM and ViT. It does not add LoRA adapters to the connector or action expert. With the recipe below, the connector and action expert are instead trained as regular full parameters because `--ft_vlm=true` and `--ft_action_expert=true`; set the corresponding flag to `false` to freeze them. Use LoRA for smaller datasets or similar embodiments.
 
 ```bash
 export EXP_NAME="molmoact2-my-robot-lora"
@@ -214,6 +266,34 @@ HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}" WANDB_API_KEY="${WANDB_API_KEY:-}" torchr
   --connector_learning_rate=5e-5 \
   --action_expert_learning_rate=5e-5
 ```
+
+#### LoRA Checkpoint Layout
+
+Each LoRA save produces several directories with different purposes:
+
+| Directory | Contents and intended use |
+| --- | --- |
+| `stepX` | Sharded model, optimizer, and trainer state. Use this directory to resume training at step X. It is not the deployment checkpoint. |
+| `stepX-lora-llm` | LLM PEFT adapter files used as an intermediate input when building the merged checkpoint. This is not a complete MolmoAct2 checkpoint. |
+| `stepX-lora-vision` | ViT PEFT adapter files used as an intermediate input when building the merged checkpoint. This is not a complete MolmoAct2 checkpoint. |
+| `stepX-merged` | Complete unsharded model with the LLM and ViT adapters merged and all trained non-LoRA components, including the action expert. This is the final model checkpoint for inference or export. |
+
+Convert the merged checkpoint to Hugging Face format with:
+
+```bash
+python -m olmo.hf_model.convert_molmoact2_to_hf \
+  path/to/stepX-merged \
+  path/to/stepX-hf
+```
+
+Alternatively, use `stepX-merged` directly with the vendored LeRobot inference, evaluation, or async serving tools:
+
+```bash
+--policy.type=molmoact2 \
+--policy.checkpoint_path=path/to/stepX-merged
+```
+
+See [issue #30](https://github.com/allenai/molmoact2/issues/30) for the original checkpoint-layout question.
 
 ### Action-Expert-Only Fine-Tuning
 
@@ -269,6 +349,8 @@ See `lerobot/docs/source/molmoact2.mdx` for deployment commands and LeRobot-spec
 ## Reproducing Released Training Stages
 
 The commands below reproduce the major MolmoAct2 training stages. They are references for release replication; for new projects, start with the new-dataset fine-tuning section above.
+
+These commands intentionally retain the packed data settings used by the released runs. Do not copy their packed batch size and step budget directly to an unpacked custom-data fine-tune; use the custom fine-tuning defaults and budget guidance above instead.
 
 ### Molmo2-ER Training
 

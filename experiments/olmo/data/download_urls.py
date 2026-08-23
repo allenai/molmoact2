@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from olmo.data.dataset import DATA_HOME
 from olmo.io import _s3_get_bytes_range
+from olmo.util import flatten_list
 
 if "PIXMO_IMAGE_DIR" in os.environ:
     PIXMO_IMAGES = os.environ["PIXMO_IMAGE_DIR"]
@@ -166,11 +167,15 @@ def download_pixmo_urls(
     verify=True
 ) -> Dict[str, str]:
     """Download urls from a PixMo dataset, return a map of urls->filename"""
-    if check_sha:
+    if "image_urls" in data.features:
+        if check_sha:
+            raise ValueError("SHA validation is not supported for nested image_urls")
+        urls_and_shas = [(url, None) for url in set(flatten_list(data["image_urls"]))]
+    elif check_sha:
         urls_and_shas = list(dict(zip(data["image_url"], data["image_sha256"])).items())
     else:
         urls_and_shas = [(url, None) for url in list(set(data["image_url"]))]
-    if "internal_url" in data:
+    if "internal_url" in data.features:
         urls_and_shas = [(url, (sha, internal)) for (url, sha), internal
                          in zip(urls_and_shas, data["internal_url"])]
 
