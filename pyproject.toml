@@ -5,8 +5,8 @@ description = "MolmoAct2 inference server (FastAPI)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "torch==2.5.1",
-    "torchvision==0.20.1",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "transformers>=4.57,<4.58",
     "accelerate>=1.0",
     "safetensors>=0.4",
@@ -28,14 +28,14 @@ dependencies = [
 ]
 
 [tool.uv]
-# Resolve CUDA-12.1 PyTorch wheels from the official PyTorch index.
-extra-index-url = ["https://download.pytorch.org/whl/cu121"]
+# Resolve CUDA-12.8 PyTorch wheels from the official PyTorch index.
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
-torchvision = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true

@@ -18,8 +18,8 @@ The rest of MolmoAct2 (training, fine-tuning, eval) is "coming soon" per the REA
 
 ## Environment
 
-- Python is pinned to 3.11 via `.python-version`; `uv` manages everything.
-- Torch wheels come from the CUDA-12.1 PyTorch index (configured in `pyproject.toml` under `[tool.uv.sources]`). Don't relax these pins casually — the model loading code path was validated against torch 2.5.1 / transformers 4.57.x.
+- Python 3.11 and 3.12 are supported; `uv` manages the environment.
+- Torch wheels come from the CUDA-12.8 PyTorch index (configured in `pyproject.toml` under `[tool.uv.sources]`). Don't relax these pins casually — the policy servers target torch 2.11.0 / torchvision 0.26.0 / transformers 4.57.x.
 - After pulling new commits: `uv sync`. After cloning: also `git submodule update --init --recursive`.
 
 ## Common commands
