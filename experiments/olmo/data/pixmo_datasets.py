@@ -1,14 +1,13 @@
 import json
 import logging
 import os
-import re
-import shutil
-from multiprocessing import Pool
-from os.path import join, exists, basename
-from typing import Iterable, List, Literal
-from collections import defaultdict
 import random
 import re
+import shutil
+from collections import defaultdict
+from multiprocessing import Pool
+from os.path import basename, exists, join, relpath
+from typing import Iterable, List, Literal
 
 import PIL
 import datasets
@@ -20,8 +19,13 @@ from PIL import ImageOps, Image
 from torchvision.transforms.functional import affine, InterpolationMode
 from tqdm import tqdm
 
-from olmo.data.dataset import DATA_HOME, Dataset, DatasetBase, WEB_DATA_HOME
-from olmo.data.download_urls import download_pixmo_urls, filter_and_group_data, add_internal_urls
+from olmo.data.dataset import DATA_HOME, Dataset, DatasetBase, HfDataset, WEB_DATA_HOME
+from olmo.data.download_urls import (
+    PIXMO_IMAGES,
+    compute_hash,
+    download_pixmo_urls,
+    filter_and_group_data,
+)
 from olmo.preprocessing.detect_counting_question import is_pixmo_point_and_count_question
 from olmo.preprocessing.image_preprocessor import load_pil_image, save_images, load_image
 from olmo.util import transpose_dict_of_lists, flatten_lists, resource_path
@@ -562,7 +566,6 @@ class PixMoCap(Dataset):
         if exists(local_name):
             return
         ds = datasets.load_dataset("allenai/pixmo-cap", split="train")
-        ds = add_internal_urls(ds)
         if sample:
             ds = ds.take(sample)
         url_to_filename = download_pixmo_urls(ds, n_procs, check_sha=check_sha, cache_only=cache_only, verify=VERIFY)
@@ -985,46 +988,11 @@ class CoSyn(Dataset):
         )
 
 
-class CoSynPoint(Dataset):
-
-    @classmethod
-    def download(cls, n_procs=1):
-        local_name = join(PIXMO_DATASETS, "cosyn-point")
-        if exists(local_name):
-            return
-        local_data_name = cached_path(
-            join(PIXMO_DATASETS, "cosyn-point-data.json"), cache_dir=os.environ.get("MOLMO_CACHE_DIR"),
-        )
-        with open(local_data_name, 'r') as f:
-            data = json.load(f)
-        id2data = {ex["id"]: ex for ex in data}
-        all_data = datasets.DatasetDict()
-        for split in ["train", "validation"]:
-            ds = datasets.load_dataset("allenai/CoSyn-point", split=split)
-            pil_images = (ex["image"] for ex in ds)
-            filenames = [
-                join(COSYN_IMAGES, "point", f"{img_id}.png")
-                for img_id in ds["id"]
-            ]
-            saved_images = save_images(pil_images, filenames, n_procs)
-            assert len(saved_images) == len(filenames)
-            def pil_to_path(ex):
-                ex["image"] = join(COSYN_IMAGES, "point", f"{ex['id']}.png")
-                return ex
-            new_features = ds.features.copy()
-            new_features["image"] = datasets.Value("string")
-            ds = ds.map(pil_to_path, features=new_features)
-            ds = ds.add_column("names", [id2data[x]["names"] for x in ds["id"]])
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
+class CoSynPoint(HfDataset):
+    PATH = "allenai/CoSyn-point"
 
     def __init__(self, split, keep_in_memory=False):
-        assert split in ["train", "validation"]
-        self.dataset = datasets.load_from_disk(
-            join(PIXMO_DATASETS, "cosyn-point"), keep_in_memory=keep_in_memory)[split]
-
-    def __len__(self):
-        return len(self.dataset)
+        super().__init__(split, keep_in_memory=keep_in_memory)
 
     def get(self, item, rng):
         example = self.dataset[item]
@@ -1124,6 +1092,91 @@ class CorrectionQa(Dataset):
         return dict(
             image=image,
             message_list=messages,
+        )
+
+
+class PixMoMultiImageQa(Dataset):
+    HOME = join(PIXMO_DATASETS, "pixmo-multi-image-qa")
+
+    @classmethod
+    def download(cls, n_procs=1, check_sha=False, cache_only=False):
+        if exists(cls.HOME):
+            return
+        dataset = datasets.DatasetDict()
+        for split in ["train", "validation"]:
+            ds = datasets.load_dataset("allenai/Molmo2-MultiImageQA", split=split)
+            url_to_filename = download_pixmo_urls(
+                ds,
+                n_procs,
+                check_sha=check_sha,
+                cache_only=cache_only,
+                verify=False,
+            )
+            ds = ds.filter(
+                lambda urls: all(url in url_to_filename for url in urls),
+                input_columns=["image_urls"],
+            )
+            ds = ds.add_column(
+                "image",
+                [
+                    [relpath(url_to_filename[url], PIXMO_IMAGES) for url in urls]
+                    for urls in ds["image_urls"]
+                ],
+            )
+            dataset[split] = ds
+        save_local_dataset(dataset, cls.HOME, n_procs)
+
+    def __init__(
+        self,
+        split,
+        multi_image_only=False,
+        max_images=None,
+        prefix_how_many=True,
+        keep_in_memory=False,
+    ):
+        if split not in ["train", "validation"]:
+            raise ValueError(f"Unknown split {split}")
+        self.split = split
+        self.prefix_how_many = prefix_how_many
+        self.multi_image_only = multi_image_only
+        self.max_images = max_images
+        self.dataset = datasets.load_from_disk(
+            self.HOME, keep_in_memory=keep_in_memory
+        )[split]
+        if max_images is not None:
+            minimum_images = 2 if multi_image_only else 1
+            self.dataset = self.dataset.filter(
+                lambda urls: minimum_images <= len(urls) <= max_images,
+                input_columns=["image_urls"],
+            )
+        elif multi_image_only:
+            self.dataset = self.dataset.filter(
+                lambda urls: len(urls) >= 2,
+                input_columns=["image_urls"],
+            )
+        else:
+            self.dataset = self.dataset.filter(
+                lambda urls: len(urls) >= 2,
+                input_columns=["image_urls"],
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def get(self, item, rng):
+        example = self.dataset[item]
+        messages = []
+        for question, answer in zip(
+            example["qa_pairs"]["question"], example["qa_pairs"]["answer"]
+        ):
+            if self.prefix_how_many and is_pixmo_point_and_count_question(question, answer):
+                prefix = NO_POINT_PREFIX[rng.randint(0, len(NO_POINT_PREFIX))]
+                question = prefix + question
+            messages.append(dict(question=question, answer=answer, style="correction_qa"))
+        return dict(
+            image=[join(PIXMO_IMAGES, path) for path in example["image"]],
+            message_list=messages,
+            metadata=dict(image_urls=example["image_urls"]),
         )
 
 
@@ -1283,62 +1336,38 @@ class PixMoMultiPoints(Dataset):
             "multi_image_pointing",
             "multi_image_point_then_count",
         ]
+    HOME = join(PIXMO_DATASETS, "pixmo-multi-points")
 
     @classmethod
-    def download(cls, n_procs=1, n_val=2048):
-        local_name = join(PIXMO_DATASETS, "pixmo-multi-points")
-        if exists(local_name):
+    def download(cls, n_procs=1):
+        if exists(cls.HOME):
             return
-        # Load the JSONL file - use single file for all environments
-        # jsonl_filename = "multi_v3det_cot_normed_filtered.jsonl"
-        json_filename = "pixmo-multi-points-meta-filtered.json"
-        json_path = join(PIXMO_DATASETS, json_filename)
-        local_json_path = json_path
-        
-        # Read the JSONL file
-        with open(local_json_path, 'r') as f:
-            data_dict = json.load(f)
+        PixMoPoints.download(n_procs=n_procs)
+        dataset = datasets.load_dataset("allenai/molmo2-pixmo-multi-points")
+        image_exists_cache = {}
 
-        data_list = []
-        for id_key, meta_data in data_dict.items():
-            # Transform the data to have a consistent structure
-            # Collect all images, labels, points, etc. into lists
-            images = []
-            image_urls = []
-            labels = []
-            points = []
-            counts = []
-            collection_methods = []
-            normalized_labels = []
-            
-            # Iterate through all pixmopoint entries for this id
-            for key, value in meta_data.items():
-                if key.startswith('pixmopoint_') and value is not None:
-                    images.append(value['image'])
-                    image_urls.append(value['image_url'])
-                    labels.append(value['label'])
-                    normalized_labels.append(value['normalized_label'])
-                    points.append(value['points'])
-                    counts.append(value['count'])
-                    collection_methods.append(value['collection_method'])
-            
-            # Create a consistent row structure
-            row = {
-                "id": id_key,
-                "images": images,
-                "image_urls": image_urls,
-                "labels": labels,
-                "normalized_labels": normalized_labels,
-                "points": points,
-                "counts": counts,
-                "collection_methods": collection_methods
-            }
-            data_list.append(row)
+        def use_local_images(example):
+            example["images"] = [
+                join(PIXMO_IMAGES, compute_hash(url)) for url in example["image_urls"]
+            ]
+            return example
 
-        # Create dataset
-        ds = datasets.Dataset.from_list(data_list)
-        all_data = datasets.DatasetDict(train=ds)
-        save_local_dataset(all_data, join(PIXMO_DATASETS, "pixmo-multi-points"), n_procs)
+        dataset = dataset.map(use_local_images, num_proc=n_procs)
+
+        def images_exist(image_paths):
+            for image_path in image_paths:
+                if image_path not in image_exists_cache:
+                    image_exists_cache[image_path] = file_exists(image_path)
+                if not image_exists_cache[image_path]:
+                    return False
+            return True
+
+        dataset = dataset.filter(
+            images_exist,
+            input_columns=["images"],
+            num_proc=n_procs,
+        )
+        save_local_dataset(dataset, cls.HOME, n_procs)
     
     def __init__(self, split, keep_in_memory=False,
                  styles=("multi_image_pointing", "multi_image_point_then_count")):
@@ -1347,12 +1376,11 @@ class PixMoMultiPoints(Dataset):
         self.styles = styles
         self.split = split
         # Load the dataset
-        local_name = join(PIXMO_DATASETS, "pixmo-multi-points")
-        if not is_dir(local_name):
+        if not is_dir(self.HOME):
             # Try to download if it does not exist
             PixMoMultiPoints.download()
         self.dataset = datasets.load_from_disk(
-            join(PIXMO_DATASETS, "pixmo-multi-points"), keep_in_memory=keep_in_memory)[split]
+            self.HOME, keep_in_memory=keep_in_memory)[split]
 
     def __len__(self):
         return len(self.dataset)
@@ -1897,4 +1925,3 @@ class GroundCUA(DatasetBase):
 
     def get(self, item, rng):
         return self.data[item]
-

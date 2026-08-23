@@ -36,6 +36,50 @@ export HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 ```
 
+## Downloading VLM Data
+
+The VLM data pipeline uses both the Hugging Face cache and processed datasets under
+`MOLMO_DATA_DIR`. Set both locations before running the downloader:
+
+```bash
+export MOLMO_DATA_DIR=/path/to/molmo/data
+export HF_HOME=/path/to/molmo/data/huggingface
+mkdir -p "${MOLMO_DATA_DIR}" "${HF_HOME}"
+```
+
+From the `experiments` directory, download one dataset, several datasets, or a built-in group:
+
+```bash
+python scripts/download_datasets.py pixmo_points_train --n-procs 8
+python scripts/download_datasets.py pixmo_points_train cosyn_point --n-procs 8
+python scripts/download_datasets.py pixmo
+python scripts/download_datasets.py image_pointing
+python scripts/download_datasets.py demo
+```
+
+`all` downloads the union of the built-in `pixmo`, `image_pointing`, `video_pointing`,
+`video_tracking`, and `demo` groups. Duplicate entries are downloaded only once, and the
+command reports every failed dataset before exiting nonzero:
+
+```bash
+python scripts/download_datasets.py all --n-procs 8
+```
+
+Public image data uses the same released sources as Molmo2. In particular,
+`cosyn_point`, `pixmo_multi_points`, and `pixmo_multi_image_qa` are loaded from
+`allenai/CoSyn-point`, `allenai/molmo2-pixmo-multi-points`, and
+`allenai/Molmo2-MultiImageQA`. They do not require private metadata JSON files.
+
+Processed image datasets are written below `${MOLMO_DATA_DIR}/torch_datasets`, shared
+PixMo images below `${MOLMO_DATA_DIR}/torch_datasets/pixmo_images`, and Hugging Face
+artifacts below `${HF_HOME}`. Downloads can be resumed safely because existing completed
+datasets and image files are reused.
+
+Some video and tracking datasets still require accepting a Hugging Face agreement or a
+manual download because of their upstream licenses. Those datasets are not replaced by
+the public PixMo download path; follow the error from the corresponding class in
+`olmo/data/video_datasets.py` or `olmo/data/video_object_tracking_datasets.py`.
+
 ## Checkpoints
 
 `launch_scripts/train_lerobot.py` accepts local checkpoint paths, URLs, and Hugging Face model IDs.
