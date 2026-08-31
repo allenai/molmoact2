@@ -52,7 +52,7 @@ def _build_open_box(scene, name, inner_half, height, wall_thickness,
     return builder.build_static(name=name) if body_type == "static" else builder.build(name=name)
 
 
-@register_env("BimanualYAMPutEverythingInBox-v1", max_episode_steps=400)
+@register_env("BimanualYAMPutEverythingInBox-v1", max_episode_steps=400, asset_download_ids=["ycb"])
 class BimanualYAMPutEverythingInBoxEnv(BaseEnv):
     """
     Put-Everything-In-Box task for the YAM bimanual robot.
